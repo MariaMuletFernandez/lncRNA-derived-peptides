@@ -1,0 +1,890 @@
+# ============================================================
+# CHARACTERIZATION OF TRYPTIC, SEMI-TRYPTIC AND NON-TRYPTIC
+# lncRNA-DERIVED PEPTIDES
+# ============================================================
+#
+# This script compares peptide sequence features among three
+# trypticity classes:
+#
+#   - Tryptic
+#   - Semi-tryptic
+#   - Non-tryptic
+#
+# INPUT REQUIREMENT
+# -----------------
+# The input Excel file must contain:
+#   1. A peptide-sequence column.
+#   2. A classification column indicating whether each peptide is
+#      tryptic, semi-tryptic or non-tryptic.
+#   3. Optionally, a reported peptide-length column.
+#
+# Common classification labels are standardized automatically.
+# All three classes are retained and compared throughout the analysis.
+# The script also reports the most frequent amino-acid pairs and
+# triplets specifically within the non-tryptic group.
+#
+# Main analyses
+# -------------
+#   - peptide-length comparison
+#   - amino-acid composition by class
+#   - amino-acid group composition by class
+#   - sequence-complexity comparison
+#   - overlapping amino-acid pairs and triplets
+#   - physicochemical-property comparison
+#
+# Statistical approach
+# --------------------
+# Global comparisons use Kruskal-Wallis tests. Pairwise comparisons
+# use Wilcoxon rank-sum tests with Benjamini-Hochberg correction.
+#
+# Author: Maria Mulet
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Required packages
+# ------------------------------------------------------------
+
+required_packages <- c(
+  "readxl",
+  "openxlsx",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "stringr",
+  "purrr",
+  "Peptides"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "The following packages are required but not installed: ",
+      paste(missing_packages, collapse = ", "),
+      ".\nInstall them before running this script, for example:\n",
+      "install.packages(c(",
+      paste(sprintf('"%s"', missing_packages), collapse = ", "),
+      "))"
+    ),
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(purrr)
+  library(Peptides)
+})
+
+# ------------------------------------------------------------
+# 2. User configuration
+# ------------------------------------------------------------
+
+input_file <- "input_peptides.xlsx"
+output_dir <- "trypticity_characterization_results"
+input_sheet <- 1
+
+# Required columns
+peptide_column <- "Peptide"
+classification_column <- "Classification"
+
+# Optional column. Set to NULL if the input file has no length column.
+length_column <- "Length"
+
+# Number of amino-acid pairs and triplets to report.
+top_n_ngrams <- 20
+
+# Significance threshold used in statistical summaries.
+alpha <- 0.05
+
+# Plot dimensions in inches.
+plot_width <- 7
+narrow_plot_width <- 6
+plot_height <- 5
+
+# ------------------------------------------------------------
+# 3. Helper functions
+# ------------------------------------------------------------
+
+check_required_columns <- function(data, required_columns) {
+  missing_columns <- setdiff(required_columns, colnames(data))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      paste0(
+        "The input file is missing the following required column(s): ",
+        paste(missing_columns, collapse = ", "),
+        ".\nUpdate peptide_column and classification_column in the ",
+        "USER CONFIGURATION section."
+      ),
+      call. = FALSE
+    )
+  }
+}
+
+clean_peptide_sequence <- function(sequence) {
+  sequence <- toupper(str_trim(as.character(sequence)))
+  str_replace_all(sequence, "[^ACDEFGHIKLMNPQRSTVWY]", "")
+}
+
+standardize_classification <- function(classification) {
+  normalized <- classification %>%
+    as.character() %>%
+    str_trim() %>%
+    str_to_lower() %>%
+    str_replace_all("_", "-") %>%
+    str_squish()
+
+  case_when(
+    normalized %in% c(
+      "tryptic", "triptico", "tríptico"
+    ) ~ "Tryptic",
+
+    normalized %in% c(
+      "semi-tryptic", "semitryptic", "semi tryptic",
+      "semi-triptico", "semitriptico", "semi-tríptico"
+    ) ~ "Semi-tryptic",
+
+    normalized %in% c(
+      "non-tryptic", "non tryptic", "nontryptic",
+      "no triptico", "no tríptico", "non-triptico",
+      "non-tríptico"
+    ) ~ "Non-tryptic",
+
+    TRUE ~ NA_character_
+  )
+}
+
+unique_aa_fraction <- function(sequence) {
+  residues <- str_split(sequence, "", simplify = FALSE)[[1]]
+
+  if (length(residues) == 0) {
+    return(NA_real_)
+  }
+
+  length(unique(residues)) / length(residues)
+}
+
+shannon_entropy <- function(sequence) {
+  residues <- str_split(sequence, "", simplify = FALSE)[[1]]
+
+  if (length(residues) == 0) {
+    return(NA_real_)
+  }
+
+  frequencies <- table(residues) / length(residues)
+  -sum(frequencies * log2(frequencies))
+}
+
+get_ngrams <- function(sequence, n) {
+  sequence_length <- nchar(sequence)
+
+  if (is.na(sequence_length) || sequence_length < n) {
+    return(character(0))
+  }
+
+  start_positions <- seq_len(sequence_length - n + 1)
+
+  str_sub(
+    sequence,
+    start = start_positions,
+    end = start_positions + n - 1
+  )
+}
+
+safe_peptide_metric <- function(sequence, metric_function, ...) {
+  tryCatch(
+    metric_function(sequence, ...),
+    error = function(error) NA_real_
+  )
+}
+
+save_plot <- function(plot_object, filename, width, height) {
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = plot_object,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300
+  )
+}
+
+run_kruskal_test <- function(data, variable) {
+  valid_data <- data %>%
+    filter(!is.na(.data[[variable]]), !is.na(Classification))
+
+  if (n_distinct(valid_data$Classification) < 2) {
+    return(tibble(
+      Variable = variable,
+      Statistic = NA_real_,
+      Degrees_of_freedom = NA_real_,
+      P_value = NA_real_
+    ))
+  }
+
+  test <- kruskal.test(
+    reformulate("Classification", response = variable),
+    data = valid_data
+  )
+
+  tibble(
+    Variable = variable,
+    Statistic = unname(test$statistic),
+    Degrees_of_freedom = unname(test$parameter),
+    P_value = test$p.value
+  )
+}
+
+run_pairwise_wilcox <- function(data, variable) {
+  valid_data <- data %>%
+    filter(!is.na(.data[[variable]]), !is.na(Classification))
+
+  if (n_distinct(valid_data$Classification) < 2) {
+    return(tibble())
+  }
+
+  test <- pairwise.wilcox.test(
+    x = valid_data[[variable]],
+    g = valid_data$Classification,
+    p.adjust.method = "BH",
+    exact = FALSE
+  )
+
+  as.data.frame(as.table(test$p.value), stringsAsFactors = FALSE) %>%
+    filter(!is.na(Freq)) %>%
+    transmute(
+      Variable = variable,
+      Group_1 = as.character(Var1),
+      Group_2 = as.character(Var2),
+      Adjusted_P_value = as.numeric(Freq),
+      Significant = Adjusted_P_value < alpha
+    )
+}
+
+# ------------------------------------------------------------
+# 4. Read and validate the input file
+# ------------------------------------------------------------
+
+if (!file.exists(input_file)) {
+  stop(
+    paste0(
+      "Input file not found: ", input_file,
+      "\nUpdate input_file in the USER CONFIGURATION section."
+    ),
+    call. = FALSE
+  )
+}
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+raw_data <- read_excel(input_file, sheet = input_sheet) %>%
+  as.data.frame()
+
+check_required_columns(
+  raw_data,
+  c(peptide_column, classification_column)
+)
+
+cat("Classification labels detected in the input file:\n")
+print(table(raw_data[[classification_column]], useNA = "ifany"))
+
+# ------------------------------------------------------------
+# 5. Clean sequences and standardize classifications
+# ------------------------------------------------------------
+
+clean_data <- raw_data %>%
+  mutate(
+    Peptide = clean_peptide_sequence(.data[[peptide_column]]),
+    Classification_original = as.character(.data[[classification_column]]),
+    Classification = standardize_classification(
+      .data[[classification_column]]
+    ),
+    Calculated_length = nchar(Peptide)
+  )
+
+unrecognized_labels <- clean_data %>%
+  filter(
+    !is.na(Classification_original),
+    str_trim(Classification_original) != "",
+    is.na(Classification)
+  ) %>%
+  count(Classification_original, name = "Count") %>%
+  arrange(desc(Count))
+
+clean_data <- clean_data %>%
+  filter(
+    !is.na(Peptide),
+    Peptide != "",
+    !is.na(Classification)
+  )
+
+if (!is.null(length_column) && length_column %in% colnames(raw_data)) {
+  clean_data <- clean_data %>%
+    mutate(
+      Reported_length = suppressWarnings(
+        as.numeric(.data[[length_column]])
+      ),
+      Length_difference = Reported_length - Calculated_length
+    )
+} else {
+  clean_data <- clean_data %>%
+    mutate(
+      Reported_length = NA_real_,
+      Length_difference = NA_real_
+    )
+}
+
+clean_data <- clean_data %>%
+  mutate(
+    Length = Calculated_length,
+    Classification = factor(
+      Classification,
+      levels = c("Tryptic", "Semi-tryptic", "Non-tryptic")
+    )
+  )
+
+class_counts <- clean_data %>%
+  count(Classification, name = "Peptide_count") %>%
+  complete(
+    Classification = factor(
+      c("Tryptic", "Semi-tryptic", "Non-tryptic"),
+      levels = c("Tryptic", "Semi-tryptic", "Non-tryptic")
+    ),
+    fill = list(Peptide_count = 0)
+  )
+
+if (any(class_counts$Peptide_count == 0)) {
+  missing_classes <- class_counts %>%
+    filter(Peptide_count == 0) %>%
+    pull(Classification) %>%
+    as.character()
+
+  stop(
+    paste0(
+      "The analysis requires all three classifications, but no valid ",
+      "peptides were found for: ",
+      paste(missing_classes, collapse = ", "),
+      ".\nCheck the values in the classification column."
+    ),
+    call. = FALSE
+  )
+}
+
+cat("\nPeptides retained after cleaning:\n")
+print(class_counts)
+
+# ------------------------------------------------------------
+# 6. Shared visual settings
+# ------------------------------------------------------------
+
+class_colors <- c(
+  "Tryptic" = "lightsteelblue2",
+  "Semi-tryptic" = "darkseagreen2",
+  "Non-tryptic" = "lightpink2"
+)
+
+base_theme <- theme_classic() +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+
+# ------------------------------------------------------------
+# 7. Peptide-length comparison
+# ------------------------------------------------------------
+
+length_summary <- clean_data %>%
+  group_by(Classification) %>%
+  summarise(
+    n = n(),
+    mean_length = mean(Length, na.rm = TRUE),
+    sd_length = sd(Length, na.rm = TRUE),
+    median_length = median(Length, na.rm = TRUE),
+    Q1 = quantile(Length, 0.25, na.rm = TRUE),
+    Q3 = quantile(Length, 0.75, na.rm = TRUE),
+    min_length = min(Length, na.rm = TRUE),
+    max_length = max(Length, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+length_kruskal <- run_kruskal_test(clean_data, "Length")
+length_pairwise <- run_pairwise_wilcox(clean_data, "Length")
+
+length_plot <- ggplot(
+  clean_data,
+  aes(x = Classification, y = Length, fill = Classification)
+) +
+  geom_violin(trim = FALSE, alpha = 0.5, colour = NA) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    alpha = 0.8,
+    colour = "black"
+  ) +
+  geom_jitter(width = 0.12, size = 1.7, alpha = 0.55) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  labs(x = NULL, y = "Peptide length (amino acids)") +
+  base_theme +
+  theme(legend.position = "none")
+
+save_plot(
+  length_plot,
+  "peptide_length_by_classification.png",
+  narrow_plot_width,
+  plot_height
+)
+
+# ------------------------------------------------------------
+# 8. Amino-acid composition
+# ------------------------------------------------------------
+
+aa_long <- clean_data %>%
+  select(Peptide, Classification) %>%
+  mutate(Amino_acid = str_split(Peptide, "")) %>%
+  unnest(Amino_acid)
+
+all_amino_acids <- c(
+  "A", "C", "D", "E", "F", "G", "H", "I", "K", "L",
+  "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"
+)
+
+aa_composition <- aa_long %>%
+  count(Classification, Amino_acid, name = "Count") %>%
+  complete(
+    Classification,
+    Amino_acid = all_amino_acids,
+    fill = list(Count = 0)
+  ) %>%
+  group_by(Classification) %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  ungroup()
+
+aa_plot <- ggplot(
+  aa_composition,
+  aes(x = Amino_acid, y = Percentage, fill = Classification)
+) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  labs(
+    x = "Amino acid",
+    y = "Amino-acid frequency (%)",
+    fill = "Peptide class"
+  ) +
+  base_theme
+
+save_plot(
+  aa_plot,
+  "amino_acid_composition_by_classification.png",
+  9,
+  plot_height
+)
+
+nontryptic_aa <- aa_composition %>%
+  filter(Classification == "Non-tryptic") %>%
+  arrange(desc(Percentage))
+
+# ------------------------------------------------------------
+# 9. Amino-acid group composition
+# ------------------------------------------------------------
+
+aa_groups <- tibble(
+  Amino_acid = all_amino_acids,
+  AA_group = c(
+    "Hydrophobic", "Polar", "Acidic", "Acidic", "Aromatic",
+    "Gly/Pro", "Basic", "Hydrophobic", "Basic", "Hydrophobic",
+    "Hydrophobic", "Polar", "Gly/Pro", "Polar", "Basic",
+    "Ser/Thr", "Ser/Thr", "Hydrophobic", "Aromatic", "Aromatic"
+  )
+)
+
+group_composition <- aa_long %>%
+  left_join(aa_groups, by = "Amino_acid") %>%
+  count(Classification, AA_group, name = "Count") %>%
+  group_by(Classification) %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  ungroup()
+
+group_plot <- ggplot(
+  group_composition,
+  aes(x = AA_group, y = Percentage, fill = Classification)
+) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  labs(
+    x = NULL,
+    y = "Amino-acid group frequency (%)",
+    fill = "Peptide class"
+  ) +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+save_plot(
+  group_plot,
+  "amino_acid_group_composition.png",
+  8,
+  plot_height
+)
+
+# ------------------------------------------------------------
+# 10. Sequence-complexity comparison
+# ------------------------------------------------------------
+
+complexity_data <- clean_data %>%
+  mutate(
+    Unique_AA_fraction = map_dbl(Peptide, unique_aa_fraction),
+    Shannon_entropy = map_dbl(Peptide, shannon_entropy)
+  )
+
+complexity_summary <- complexity_data %>%
+  group_by(Classification) %>%
+  summarise(
+    n = n(),
+    mean_unique_fraction = mean(Unique_AA_fraction, na.rm = TRUE),
+    sd_unique_fraction = sd(Unique_AA_fraction, na.rm = TRUE),
+    median_unique_fraction = median(Unique_AA_fraction, na.rm = TRUE),
+    mean_entropy = mean(Shannon_entropy, na.rm = TRUE),
+    sd_entropy = sd(Shannon_entropy, na.rm = TRUE),
+    median_entropy = median(Shannon_entropy, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+complexity_variables <- c("Unique_AA_fraction", "Shannon_entropy")
+
+complexity_kruskal <- map_dfr(
+  complexity_variables,
+  ~ run_kruskal_test(complexity_data, .x)
+)
+
+complexity_pairwise <- map_dfr(
+  complexity_variables,
+  ~ run_pairwise_wilcox(complexity_data, .x)
+)
+
+complexity_long <- complexity_data %>%
+  select(Classification, Unique_AA_fraction, Shannon_entropy) %>%
+  pivot_longer(
+    cols = c(Unique_AA_fraction, Shannon_entropy),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Metric = recode(
+      Metric,
+      Unique_AA_fraction = "Unique amino-acid fraction",
+      Shannon_entropy = "Shannon entropy"
+    )
+  )
+
+complexity_plot <- ggplot(
+  complexity_long,
+  aes(x = Classification, y = Value, fill = Classification)
+) +
+  geom_violin(trim = FALSE, alpha = 0.45, linewidth = 0.4) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    alpha = 0.7,
+    colour = "black"
+  ) +
+  geom_jitter(width = 0.12, size = 1.5, alpha = 0.55) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  facet_wrap(~ Metric, scales = "free_y", ncol = 2) +
+  labs(x = NULL, y = NULL) +
+  base_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+
+save_plot(
+  complexity_plot,
+  "sequence_complexity_by_classification.png",
+  9,
+  plot_height
+)
+
+# ------------------------------------------------------------
+# 11. Amino-acid pairs and triplets
+# ------------------------------------------------------------
+
+pair_data <- clean_data %>%
+  select(Peptide, Classification) %>%
+  mutate(Pair = map(Peptide, get_ngrams, n = 2)) %>%
+  unnest(Pair)
+
+pair_composition <- pair_data %>%
+  count(Classification, Pair, name = "Count") %>%
+  group_by(Classification) %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  ungroup()
+
+top_pairs_by_class <- pair_composition %>%
+  group_by(Classification) %>%
+  arrange(desc(Count), Pair, .by_group = TRUE) %>%
+  slice_head(n = top_n_ngrams) %>%
+  ungroup()
+
+top_pairs_nontryptic <- pair_composition %>%
+  filter(Classification == "Non-tryptic") %>%
+  arrange(desc(Count), Pair) %>%
+  slice_head(n = top_n_ngrams)
+
+triplet_data <- clean_data %>%
+  select(Peptide, Classification) %>%
+  mutate(Triplet = map(Peptide, get_ngrams, n = 3)) %>%
+  unnest(Triplet)
+
+triplet_composition <- triplet_data %>%
+  count(Classification, Triplet, name = "Count") %>%
+  group_by(Classification) %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  ungroup()
+
+top_triplets_by_class <- triplet_composition %>%
+  group_by(Classification) %>%
+  arrange(desc(Count), Triplet, .by_group = TRUE) %>%
+  slice_head(n = top_n_ngrams) %>%
+  ungroup()
+
+top_triplets_nontryptic <- triplet_composition %>%
+  filter(Classification == "Non-tryptic") %>%
+  arrange(desc(Count), Triplet) %>%
+  slice_head(n = top_n_ngrams)
+
+pair_plot <- ggplot(
+  top_pairs_nontryptic,
+  aes(x = reorder(Pair, Count), y = Count)
+) +
+  geom_col(fill = class_colors[["Non-tryptic"]]) +
+  coord_flip() +
+  labs(
+    x = "Amino-acid pair",
+    y = "Frequency",
+    title = "Top amino-acid pairs in non-tryptic peptides"
+  ) +
+  base_theme
+
+triplet_plot <- ggplot(
+  top_triplets_nontryptic,
+  aes(x = reorder(Triplet, Count), y = Count)
+) +
+  geom_col(fill = class_colors[["Non-tryptic"]]) +
+  coord_flip() +
+  labs(
+    x = "Amino-acid triplet",
+    y = "Frequency",
+    title = "Top amino-acid triplets in non-tryptic peptides"
+  ) +
+  base_theme
+
+save_plot(
+  pair_plot,
+  "top_pairs_nontryptic.png",
+  narrow_plot_width,
+  6
+)
+
+save_plot(
+  triplet_plot,
+  "top_triplets_nontryptic.png",
+  narrow_plot_width,
+  7
+)
+
+# ------------------------------------------------------------
+# 12. Physicochemical-property comparison
+# ------------------------------------------------------------
+
+physicochemical_data <- complexity_data %>%
+  mutate(
+    Molecular_weight = map_dbl(
+      Peptide,
+      ~ safe_peptide_metric(.x, Peptides::mw)
+    ),
+    Isoelectric_point = map_dbl(
+      Peptide,
+      ~ safe_peptide_metric(.x, Peptides::pI)
+    ),
+    Hydrophobicity = map_dbl(
+      Peptide,
+      ~ safe_peptide_metric(
+        .x,
+        Peptides::hydrophobicity,
+        scale = "KyteDoolittle"
+      )
+    ),
+    Net_charge_pH7 = map_dbl(
+      Peptide,
+      ~ safe_peptide_metric(.x, Peptides::charge, pH = 7)
+    ),
+    Boman_index = map_dbl(
+      Peptide,
+      ~ safe_peptide_metric(.x, Peptides::boman)
+    )
+  )
+
+physicochemical_variables <- c(
+  "Molecular_weight",
+  "Isoelectric_point",
+  "Hydrophobicity",
+  "Net_charge_pH7",
+  "Boman_index"
+)
+
+physicochemical_summary <- physicochemical_data %>%
+  group_by(Classification) %>%
+  summarise(
+    n = n(),
+    across(
+      all_of(physicochemical_variables),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        sd = ~ sd(.x, na.rm = TRUE),
+        median = ~ median(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+physicochemical_kruskal <- map_dfr(
+  physicochemical_variables,
+  ~ run_kruskal_test(physicochemical_data, .x)
+)
+
+physicochemical_pairwise <- map_dfr(
+  physicochemical_variables,
+  ~ run_pairwise_wilcox(physicochemical_data, .x)
+)
+
+physicochemical_long <- physicochemical_data %>%
+  select(Classification, all_of(physicochemical_variables)) %>%
+  pivot_longer(
+    cols = all_of(physicochemical_variables),
+    names_to = "Property",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Property = recode(
+      Property,
+      Molecular_weight = "Molecular weight",
+      Isoelectric_point = "Isoelectric point",
+      Hydrophobicity = "Hydrophobicity",
+      Net_charge_pH7 = "Net charge at pH 7",
+      Boman_index = "Boman index"
+    )
+  )
+
+physicochemical_plot <- ggplot(
+  physicochemical_long,
+  aes(x = Classification, y = Value, fill = Classification)
+) +
+  geom_violin(trim = FALSE, alpha = 0.45, linewidth = 0.4) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    alpha = 0.7,
+    colour = "black"
+  ) +
+  geom_jitter(width = 0.12, size = 1.3, alpha = 0.5) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  facet_wrap(~ Property, scales = "free_y", ncol = 2) +
+  labs(x = NULL, y = NULL) +
+  base_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+
+save_plot(
+  physicochemical_plot,
+  "physicochemical_properties_by_classification.png",
+  10,
+  8
+)
+
+# ------------------------------------------------------------
+# 13. Export results
+# ------------------------------------------------------------
+
+output_workbook <- file.path(
+  output_dir,
+  "trypticity_peptide_characterization.xlsx"
+)
+
+write.xlsx(
+  list(
+    Clean_data = clean_data,
+    Class_counts = class_counts,
+    Unrecognized_labels = unrecognized_labels,
+    Length_summary = length_summary,
+    Length_Kruskal = length_kruskal,
+    Length_pairwise = length_pairwise,
+    AA_composition = aa_composition,
+    Nontryptic_AA = nontryptic_aa,
+    AA_group_composition = group_composition,
+    Sequence_complexity = complexity_data,
+    Complexity_summary = complexity_summary,
+    Complexity_Kruskal = complexity_kruskal,
+    Complexity_pairwise = complexity_pairwise,
+    Pair_composition = pair_composition,
+    Top_pairs_by_class = top_pairs_by_class,
+    Top_pairs_nontryptic = top_pairs_nontryptic,
+    Triplet_composition = triplet_composition,
+    Top_triplets_by_class = top_triplets_by_class,
+    Top_triplets_nontryptic = top_triplets_nontryptic,
+    Physicochemical_data = physicochemical_data,
+    Physicochemical_summary = physicochemical_summary,
+    Physicochemical_Kruskal = physicochemical_kruskal,
+    Physicochemical_pairwise = physicochemical_pairwise
+  ),
+  file = output_workbook,
+  rowNames = FALSE,
+  overwrite = TRUE
+)
+
+# ------------------------------------------------------------
+# 14. Console summary
+# ------------------------------------------------------------
+
+cat("\n============================================================\n")
+cat("Trypticity characterization completed successfully\n")
+cat("============================================================\n")
+cat("Input peptides:", nrow(raw_data), "\n")
+cat("Valid peptides retained:", nrow(clean_data), "\n")
+cat("\nPeptides per classification:\n")
+print(class_counts)
+
+if (nrow(unrecognized_labels) > 0) {
+  cat(
+    "\nWarning:",
+    sum(unrecognized_labels$Count),
+    "rows had unrecognized classification labels and were excluded.\n"
+  )
+}
+
+cat("\nGlobal Kruskal-Wallis results:\n")
+print(
+  bind_rows(
+    length_kruskal,
+    complexity_kruskal,
+    physicochemical_kruskal
+  ) %>%
+    mutate(Significant = P_value < alpha)
+)
+
+cat("\nResults directory:", normalizePath(output_dir), "\n")
+cat("Excel workbook:", normalizePath(output_workbook), "\n")
