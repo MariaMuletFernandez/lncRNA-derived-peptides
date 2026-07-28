@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""
+lncRNA-derived peptide filtering pipeline
+=========================================
+
+This script performs the complete filtering workflow used to retain high-
+confidence lncRNA-derived peptides from a quantitative proteomics matrix.
+
+Filtering steps
+---------------
+1. Remove fully duplicated rows.
+2. Retain peptide identifications with -10logP >= 30.
+3. Remove PTM and flanking-residue annotations from peptide sequences.
+4. Aggregate rows representing the same cleaned peptide from the same lncRNA.
+5. Retain lncRNAs supported by at least two distinct peptide sequences.
+6. Retain peptides longer than 10 amino acids.
+7. Retain peptides detected in at least 2 of 3 individuals, with detection in
+   at least 2 of 3 technical replicates per individual, in at least one group.
+
+Expected sample naming convention
+---------------------------------
+Sample columns should follow this pattern:
+
+    GROUP_INDIVIDUAL_REPLICATE
+
+Examples:
+    C_1_A, C_1_B, C_1_C
+    AD3_1_A, AD3_1_B, AD3_1_C
+    AD4_2_A, AD4_2_B, AD4_2_C
+
+The group is everything before the individual number. For example, C_1_A is
+assigned to group C and individual C_1, whereas AD3_2_B is assigned to group
+AD3 and individual AD3_2.
+
+Requirements
+------------
+    pandas
+    openpyxl
+
+Usage
+-----
+1. Edit the USER CONFIGURATION section below.
+2. Run:
+
+       python lncrna_peptide_filtering_pipeline.py
+
+The script writes the final filtered table and a filtering summary to the
+selected output directory.
+
+Author: Maria Mulet
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import pandas as pd
+
+
+# ============================================================================
+# USER CONFIGURATION
+# ============================================================================
+
+INPUT_FILE = Path("input_peptides.xlsx")
+OUTPUT_DIR = Path("filtering_results")
+OUTPUT_FILE_NAME = "filtered_lncRNA_peptides.xlsx"
+SUMMARY_FILE_NAME = "filtering_summary.tsv"
+
+# Excel sheet name. Use 0 for the first sheet.
+SHEET_NAME = 0
+
+# Required metadata columns in the input table.
+ACCESSION_COLUMN = "Accession"
+RAW_PEPTIDE_COLUMN = "Peptide"
+SCORE_COLUMN = "-10lgP"
+CLEAN_PEPTIDE_COLUMN = "Clean peptide"
+
+# Identification-confidence threshold.
+MIN_SCORE = 30.0
+
+# Biological filtering thresholds.
+MIN_DISTINCT_PEPTIDES_PER_LNCRNA = 2
+MIN_PEPTIDE_LENGTH = 11  # Equivalent to retaining peptides >10 aa.
+MIN_REPLICATES_PER_INDIVIDUAL = 2
+MIN_INDIVIDUALS_PER_GROUP = 2
+
+# Values interpreted as absence in quantitative sample columns.
+ABSENCE_VALUES = {0, 0.0}
+
+# Optional metadata columns that must not be interpreted as sample columns.
+# Add any additional annotation columns present in your file.
+OPTIONAL_METADATA_COLUMNS = [
+    "Protein",
+    "Description",
+    "Gene",
+    "Length",
+    "Start",
+    "End",
+    "PTM",
+]
+
+# Columns retained as grouping identifiers when identical cleaned peptide rows
+# are aggregated. The cleaned sequence is added automatically.
+#
+# Keeping Accession prevents identical peptide sequences assigned to different
+# lncRNAs from being merged into a single entry.
+GROUPING_METADATA_COLUMNS = [
+    ACCESSION_COLUMN,
+]
+
+# Pattern used to identify sample columns and extract group, individual and
+# replicate labels. It accepts names such as C_1_A and AD3_2_C.
+SAMPLE_NAME_PATTERN = re.compile(
+    r"^(?P<group>.+?)_(?P<individual>\d+)_(?P<replicate>[^_]+)$"
+)
+
+# Save intermediate tables for transparency and troubleshooting.
+SAVE_INTERMEDIATE_FILES = True
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+
+def validate_input_file(path: Path) -> None:
+    """Raise a clear error if the input file cannot be used."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {path.resolve()}\n"
+            "Update INPUT_FILE in the USER CONFIGURATION section."
+        )
+
+    if path.suffix.lower() not in {".xlsx", ".xls"}:
+        raise ValueError("INPUT_FILE must be an Excel file (.xlsx or .xls).")
+
+
+def validate_required_columns(df: pd.DataFrame, columns: Sequence[str]) -> None:
+    """Check that all columns required by the pipeline are present."""
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "The following required columns are missing from the input file: "
+            + ", ".join(missing)
+        )
+
+
+def clean_peptide_sequence(value: object) -> str:
+    """Return an uppercase amino-acid sequence without PTM annotations.
+
+    The function performs the following operations:
+    - removes flanking residues from strings such as K.PEPTIDE.R;
+    - removes annotations enclosed in (), [], or {};
+    - removes signed mass shifts such as +15.99 or -17.03;
+    - removes dots, spaces, numbers, and other non-letter characters;
+    - converts the remaining sequence to uppercase.
+
+    Notes
+    -----
+    This function removes annotations but does not replace ambiguous amino
+    acids. Any I/L ambiguity handling should therefore be performed upstream
+    if it is part of the study-specific identification workflow.
+    """
+    if pd.isna(value):
+        return ""
+
+    sequence = str(value).strip()
+    if not sequence:
+        return ""
+
+    # Remove conventional flanking residues: K.PEPTIDE.R -> PEPTIDE
+    flank_match = re.fullmatch(r"[A-Za-z\-]\.(.+)\.[A-Za-z\-]", sequence)
+    if flank_match:
+        sequence = flank_match.group(1)
+
+    # Remove PTM names or mass annotations enclosed in brackets.
+    sequence = re.sub(r"\([^)]*\)", "", sequence)
+    sequence = re.sub(r"\[[^]]*\]", "", sequence)
+    sequence = re.sub(r"\{[^}]*\}", "", sequence)
+
+    # Remove unbracketed signed mass shifts, if present.
+    sequence = re.sub(r"[+-]\d+(?:\.\d+)?", "", sequence)
+
+    # Retain letters only and standardize case.
+    sequence = re.sub(r"[^A-Za-z]", "", sequence).upper()
+    return sequence
+
+
+def is_present(value: object) -> bool:
+    """Return True when a quantitative value represents peptide detection."""
+    if pd.isna(value):
+        return False
+
+    if value in ABSENCE_VALUES:
+        return False
+
+    # Numeric strings are interpreted numerically when possible.
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return False
+        try:
+            return float(stripped) != 0.0
+        except ValueError:
+            return True
+
+    return True
+
+
+def identify_sample_columns(
+    df: pd.DataFrame,
+) -> Tuple[List[str], Dict[str, Dict[str, List[str]]]]:
+    """Identify sample columns and organize them by group and individual.
+
+    Returns
+    -------
+    sample_columns
+        All columns matching SAMPLE_NAME_PATTERN.
+    sample_structure
+        Nested dictionary in the form:
+        {group: {individual: [replicate columns]}}.
+    """
+    sample_columns: List[str] = []
+    sample_structure: Dict[str, Dict[str, List[str]]] = {}
+
+    for column in df.columns:
+        match = SAMPLE_NAME_PATTERN.match(str(column))
+        if not match:
+            continue
+
+        group = match.group("group")
+        individual_number = match.group("individual")
+        individual_id = f"{group}_{individual_number}"
+
+        sample_columns.append(column)
+        sample_structure.setdefault(group, {}).setdefault(individual_id, []).append(column)
+
+    if not sample_columns:
+        raise ValueError(
+            "No sample columns matched SAMPLE_NAME_PATTERN. Expected names such "
+            "as C_1_A or AD3_2_C. Update SAMPLE_NAME_PATTERN if your naming "
+            "scheme is different."
+        )
+
+    return sample_columns, sample_structure
+
+
+def remove_fully_duplicated_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows whose values are identical across every column."""
+    return df.drop_duplicates(keep="first").copy()
+
+
+def filter_by_identification_score(
+    df: pd.DataFrame,
+    score_column: str,
+    minimum_score: float,
+) -> pd.DataFrame:
+    """Retain rows with a numeric -10logP value at or above the threshold."""
+    filtered = df.copy()
+    filtered[score_column] = pd.to_numeric(filtered[score_column], errors="coerce")
+    filtered = filtered[filtered[score_column] >= minimum_score].copy()
+    return filtered
+
+
+def add_clean_peptide_column(
+    df: pd.DataFrame,
+    raw_peptide_column: str,
+    clean_peptide_column: str,
+) -> pd.DataFrame:
+    """Create or overwrite the cleaned peptide-sequence column."""
+    cleaned = df.copy()
+    cleaned[clean_peptide_column] = cleaned[raw_peptide_column].apply(
+        clean_peptide_sequence
+    )
+    cleaned = cleaned[cleaned[clean_peptide_column] != ""].copy()
+    return cleaned
+
+
+def aggregate_identical_peptides(
+    df: pd.DataFrame,
+    grouping_metadata_columns: Sequence[str],
+    clean_peptide_column: str,
+    sample_columns: Sequence[str],
+) -> pd.DataFrame:
+    """Aggregate repeated entries for the same lncRNA and cleaned peptide.
+
+    Quantitative sample columns are summed. For other annotation columns, the
+    first non-null value is retained. The maximum identification score is kept
+    when SCORE_COLUMN is available.
+    """
+    grouping_columns = list(dict.fromkeys(
+        [*grouping_metadata_columns, clean_peptide_column]
+    ))
+    validate_required_columns(df, grouping_columns)
+
+    working = df.copy()
+
+    # Ensure quantitative columns are numeric before summation.
+    for column in sample_columns:
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+
+    aggregation_rules: Dict[str, str] = {}
+
+    for column in working.columns:
+        if column in grouping_columns:
+            continue
+        if column in sample_columns:
+            aggregation_rules[column] = "sum"
+        elif column == SCORE_COLUMN:
+            aggregation_rules[column] = "max"
+        else:
+            aggregation_rules[column] = "first"
+
+    aggregated = (
+        working.groupby(grouping_columns, dropna=False, as_index=False)
+        .agg(aggregation_rules)
+    )
+
+    return aggregated
+
+
+def extract_lncRNA_base(accession: object) -> str:
+    """Return the lncRNA identifier preceding the transcript suffix ':' ."""
+    if pd.isna(accession):
+        return ""
+    return str(accession).split(":", maxsplit=1)[0]
+
+
+def retain_lncrnas_with_multiple_peptides(
+    df: pd.DataFrame,
+    accession_column: str,
+    peptide_column: str,
+    minimum_peptides: int,
+) -> pd.DataFrame:
+    """Retain lncRNAs supported by at least the requested peptide count."""
+    filtered = df.copy()
+    filtered["lncRNA_base"] = filtered[accession_column].apply(extract_lncRNA_base)
+
+    peptide_counts = filtered.groupby("lncRNA_base")[peptide_column].nunique()
+    retained_lncrnas = peptide_counts[peptide_counts >= minimum_peptides].index
+
+    return filtered[filtered["lncRNA_base"].isin(retained_lncrnas)].copy()
+
+
+def filter_by_peptide_length(
+    df: pd.DataFrame,
+    peptide_column: str,
+    minimum_length: int,
+) -> pd.DataFrame:
+    """Retain peptide sequences with at least minimum_length residues."""
+    filtered = df.copy()
+    filtered["Peptide length"] = filtered[peptide_column].str.len()
+    return filtered[filtered["Peptide length"] >= minimum_length].copy()
+
+
+def peptide_passes_reproducibility_filter(
+    row: pd.Series,
+    sample_structure: Dict[str, Dict[str, List[str]]],
+    min_replicates: int,
+    min_individuals: int,
+) -> bool:
+    """Return True if a peptide passes the reproducibility rule in any group."""
+    for individuals in sample_structure.values():
+        valid_individuals = 0
+
+        for replicate_columns in individuals.values():
+            detected_replicates = sum(
+                is_present(row[column]) for column in replicate_columns
+            )
+            if detected_replicates >= min_replicates:
+                valid_individuals += 1
+
+        if valid_individuals >= min_individuals:
+            return True
+
+    return False
+
+
+def add_detection_summary(
+    df: pd.DataFrame,
+    sample_structure: Dict[str, Dict[str, List[str]]],
+    min_replicates: int,
+) -> pd.DataFrame:
+    """Add transparent per-group counts of reproducibly detected individuals."""
+    summarized = df.copy()
+
+    for group, individuals in sample_structure.items():
+        output_column = f"{group}_valid_individuals"
+
+        def count_valid_individuals(row: pd.Series) -> int:
+            count = 0
+            for replicate_columns in individuals.values():
+                detected_replicates = sum(
+                    is_present(row[column]) for column in replicate_columns
+                )
+                if detected_replicates >= min_replicates:
+                    count += 1
+            return count
+
+        summarized[output_column] = summarized.apply(
+            count_valid_individuals,
+            axis=1,
+        )
+
+    return summarized
+
+
+def filter_by_detection_reproducibility(
+    df: pd.DataFrame,
+    sample_structure: Dict[str, Dict[str, List[str]]],
+    min_replicates: int,
+    min_individuals: int,
+) -> pd.DataFrame:
+    """Apply the individual/technical-replicate reproducibility filter."""
+    with_summary = add_detection_summary(df, sample_structure, min_replicates)
+
+    mask = with_summary.apply(
+        peptide_passes_reproducibility_filter,
+        axis=1,
+        sample_structure=sample_structure,
+        min_replicates=min_replicates,
+        min_individuals=min_individuals,
+    )
+
+    return with_summary[mask].copy()
+
+
+def save_table(df: pd.DataFrame, path: Path) -> None:
+    """Save a DataFrame as an Excel workbook without the pandas index."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(path, index=False)
+
+
+def record_step(summary: List[Tuple[str, int]], name: str, df: pd.DataFrame) -> None:
+    """Append a row count to the filtering summary."""
+    summary.append((name, len(df)))
+
+
+def save_summary(summary: Iterable[Tuple[str, int]], path: Path) -> None:
+    """Write filtering-step row counts as a tab-separated text file."""
+    summary_df = pd.DataFrame(summary, columns=["Filtering step", "Rows retained"])
+    summary_df.to_csv(path, sep="\t", index=False)
+
+
+def print_sample_structure(
+    sample_structure: Dict[str, Dict[str, List[str]]],
+) -> None:
+    """Print the sample groups inferred from column names."""
+    print("\nDetected sample structure")
+    print("-------------------------")
+    for group, individuals in sample_structure.items():
+        replicate_counts = [len(columns) for columns in individuals.values()]
+        print(
+            f"{group}: {len(individuals)} individual(s); "
+            f"replicates per individual = {replicate_counts}"
+        )
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+
+def main() -> None:
+    """Run the complete peptide-filtering pipeline."""
+    validate_input_file(INPUT_FILE)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Loading input data...")
+    df = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME)
+
+    validate_required_columns(
+        df,
+        [ACCESSION_COLUMN, RAW_PEPTIDE_COLUMN, SCORE_COLUMN],
+    )
+
+    sample_columns, sample_structure = identify_sample_columns(df)
+    print_sample_structure(sample_structure)
+
+    filtering_summary: List[Tuple[str, int]] = []
+    record_step(filtering_summary, "Input rows", df)
+
+    # Step 1: remove fully duplicated rows.
+    df = remove_fully_duplicated_rows(df)
+    record_step(filtering_summary, "After removing fully duplicated rows", df)
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "01_without_full_duplicates.xlsx")
+
+    # Step 2: apply the -10logP threshold.
+    df = filter_by_identification_score(df, SCORE_COLUMN, MIN_SCORE)
+    record_step(filtering_summary, f"After {SCORE_COLUMN} >= {MIN_SCORE:g}", df)
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "02_score_filtered.xlsx")
+
+    # Step 3: remove PTM and flanking annotations.
+    df = add_clean_peptide_column(
+        df,
+        RAW_PEPTIDE_COLUMN,
+        CLEAN_PEPTIDE_COLUMN,
+    )
+    record_step(filtering_summary, "After peptide-sequence cleaning", df)
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "03_cleaned_peptides.xlsx")
+
+    # Sample columns remain the same after cleaning.
+    sample_columns, sample_structure = identify_sample_columns(df)
+
+    # Step 4: aggregate identical peptide sequences assigned to the same lncRNA.
+    df = aggregate_identical_peptides(
+        df,
+        GROUPING_METADATA_COLUMNS,
+        CLEAN_PEPTIDE_COLUMN,
+        sample_columns,
+    )
+    record_step(filtering_summary, "After aggregating identical peptides", df)
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "04_aggregated_peptides.xlsx")
+
+    # Step 5: retain lncRNAs encoding at least two distinct peptides.
+    df = retain_lncrnas_with_multiple_peptides(
+        df,
+        ACCESSION_COLUMN,
+        CLEAN_PEPTIDE_COLUMN,
+        MIN_DISTINCT_PEPTIDES_PER_LNCRNA,
+    )
+    record_step(
+        filtering_summary,
+        (
+            "After retaining lncRNAs with >= "
+            f"{MIN_DISTINCT_PEPTIDES_PER_LNCRNA} distinct peptides"
+        ),
+        df,
+    )
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "05_multi_peptide_lncrnas.xlsx")
+
+    # Step 6: retain peptides longer than 10 amino acids.
+    df = filter_by_peptide_length(
+        df,
+        CLEAN_PEPTIDE_COLUMN,
+        MIN_PEPTIDE_LENGTH,
+    )
+    record_step(
+        filtering_summary,
+        f"After retaining peptides >= {MIN_PEPTIDE_LENGTH} aa",
+        df,
+    )
+    if SAVE_INTERMEDIATE_FILES:
+        save_table(df, OUTPUT_DIR / "06_length_filtered.xlsx")
+
+    # Step 7: apply the 2/3-individual and 2/3-replicate criterion.
+    df = filter_by_detection_reproducibility(
+        df,
+        sample_structure,
+        MIN_REPLICATES_PER_INDIVIDUAL,
+        MIN_INDIVIDUALS_PER_GROUP,
+    )
+    record_step(
+        filtering_summary,
+        (
+            "After reproducibility filtering: >= "
+            f"{MIN_INDIVIDUALS_PER_GROUP} individuals and >= "
+            f"{MIN_REPLICATES_PER_INDIVIDUAL} replicates"
+        ),
+        df,
+    )
+
+    final_output_path = OUTPUT_DIR / OUTPUT_FILE_NAME
+    summary_output_path = OUTPUT_DIR / SUMMARY_FILE_NAME
+
+    save_table(df, final_output_path)
+    save_summary(filtering_summary, summary_output_path)
+
+    summary_df = pd.DataFrame(
+        filtering_summary,
+        columns=["Filtering step", "Rows retained"],
+    )
+
+    print("\nFiltering summary")
+    print("-----------------")
+    print(summary_df.to_string(index=False))
+    print(f"\nFinal table: {final_output_path.resolve()}")
+    print(f"Summary file: {summary_output_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
