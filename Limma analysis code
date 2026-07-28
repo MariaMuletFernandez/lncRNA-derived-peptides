@@ -10,8 +10,7 @@
 #   3. Collapses technical replicates by averaging them.
 #   4. Performs quantile normalization.
 #   5. Compares AD samples with all control samples using limma.
-#   6. Optionally compares the two control subgroups.
-#   7. Exports result tables and publication-ready figures.
+#   6.  Exports result tables and publication-ready figures.
 #
 # Expected sample naming convention:
 #   AD3_1_A, AD3_1_B, AD3_1_C  -> technical replicates of AD3_1
@@ -307,57 +306,9 @@ final_results <- results %>%
 
 write.xlsx(final_results, main_results_file, overwrite = TRUE)
 
-# -----------------------------
-# 10. Control subgroup comparison
-# -----------------------------
-control_samples <- all_samples[group == "Control"]
-
-if (length(control_samples) >= 2) {
-  control_type <- if_else(
-    str_detect(control_samples, sz_pool_prefix),
-    "Control_SZ",
-    "Control_AD"
-  )
-  control_type <- factor(control_type, levels = c("Control_AD", "Control_SZ"))
-
-  if (length(unique(control_type)) == 2) {
-    expr_ctrl <- normalized_matrix[, control_samples, drop = FALSE]
-    design_ctrl <- model.matrix(~ control_type)
-    rownames(design_ctrl) <- control_samples
-
-    fit_ctrl <- lmFit(expr_ctrl, design_ctrl)
-    fit_ctrl <- eBayes(fit_ctrl)
-
-    results_ctrl <- topTable(
-      fit_ctrl,
-      coef = "control_typeControl_SZ",
-      number = Inf,
-      adjust.method = "BH",
-      sort.by = "P"
-    )
-
-    results_ctrl$FeatureID <- rownames(results_ctrl)
-    rownames(results_ctrl) <- NULL
-    results_ctrl <- results_ctrl %>% mutate(FDR = adj.P.Val)
-
-    final_ctrl_results <- results_ctrl %>%
-      left_join(metadata_lookup, by = "FeatureID") %>%
-      relocate(all_of(metadata_cols), .before = FeatureID)
-
-    write.xlsx(final_ctrl_results, control_results_file, overwrite = TRUE)
-  } else {
-    warning(
-      "The control subgroup comparison was skipped because only one control type was detected."
-    )
-    final_ctrl_results <- NULL
-  }
-} else {
-  warning("The control subgroup comparison was skipped because fewer than two controls were detected.")
-  final_ctrl_results <- NULL
-}
 
 # -----------------------------
-# 11. Volcano plot
+# 10. Volcano plot
 # -----------------------------
 category_levels <- c("Down", "Not significant", "Up")
 final_results$Category <- factor(final_results$Category, levels = category_levels)
@@ -403,91 +354,9 @@ if (!is.null(volcano_xlim)) {
 
 save_plot(volcano_plot, volcano_file, width = 7, height = 6)
 
-# -----------------------------
-# 12. MA plot
-# -----------------------------
-mean_intensity <- rowMeans(normalized_matrix, na.rm = TRUE)
-mean_lookup <- data.frame(
-  FeatureID = rownames(normalized_matrix),
-  MeanIntensity = mean_intensity,
-  stringsAsFactors = FALSE
-)
-
-ma_df <- final_results %>%
-  left_join(mean_lookup, by = "FeatureID")
-
-ma_plot <- ggplot(
-  ma_df,
-  aes(x = MeanIntensity, y = logFC, color = Category)
-) +
-  geom_point(size = 2.5, alpha = 0.65, na.rm = TRUE) +
-  geom_hline(
-    yintercept = c(-log2fc_threshold, log2fc_threshold),
-    linetype = "dashed",
-    linewidth = 0.4
-  ) +
-  scale_color_manual(
-    values = c(
-      "Down" = "darkslategray3",
-      "Not significant" = "grey70",
-      "Up" = "coral"
-    ),
-    drop = FALSE
-  ) +
-  labs(
-    title = "MA plot",
-    x = "Mean normalized log2 intensity",
-    y = expression(log[2] ~ "fold change"),
-    color = NULL
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", hjust = 0.5),
-    legend.position = "top"
-  )
-
-save_plot(ma_plot, ma_file, width = 7, height = 6)
 
 # -----------------------------
-# 13. Heatmap of significant peptides
-# -----------------------------
-significant_features <- final_results %>%
-  filter(Significant == "YES") %>%
-  pull(FeatureID)
-
-if (length(significant_features) >= 2) {
-  heatmap_matrix <- normalized_matrix[significant_features, , drop = FALSE]
-
-  # Row-wise z-score. Remove rows with zero variance, which produce NA values.
-  row_sd <- apply(heatmap_matrix, 1, sd, na.rm = TRUE)
-  heatmap_matrix <- heatmap_matrix[is.finite(row_sd) & row_sd > 0, , drop = FALSE]
-
-  if (nrow(heatmap_matrix) >= 2) {
-    heatmap_scaled <- t(scale(t(heatmap_matrix)))
-
-    annotation_col <- data.frame(Group = group)
-    rownames(annotation_col) <- all_samples
-
-    pheatmap(
-      heatmap_scaled,
-      annotation_col = annotation_col,
-      show_rownames = FALSE,
-      cluster_rows = TRUE,
-      cluster_cols = TRUE,
-      border_color = NA,
-      filename = heatmap_file,
-      width = 8,
-      height = 10
-    )
-  } else {
-    warning("The heatmap was skipped because fewer than two variable significant peptides remained.")
-  }
-} else {
-  message("Heatmap skipped: fewer than two significant peptides were detected.")
-}
-
-# -----------------------------
-# 14. Boxplots of top peptides
+# 11. Boxplots of top peptides
 # -----------------------------
 top_features <- final_results %>%
   filter(Significant == "YES") %>%
@@ -540,7 +409,7 @@ if (length(top_features) > 0) {
 }
 
 # -----------------------------
-# 15. Console summary
+# 12. Console summary
 # -----------------------------
 cat("\n==========================================\n")
 cat("limma analysis completed\n")
@@ -558,13 +427,5 @@ cat(
   sep = " "
 )
 
-if (!is.null(final_ctrl_results)) {
-  cat(
-    "Control subgroup differences (FDR <", fdr_threshold, "): ",
-    sum(final_ctrl_results$FDR < fdr_threshold, na.rm = TRUE),
-    "\n",
-    sep = " "
-  )
-}
 
 cat("Results directory:", normalizePath(output_dir, mustWork = FALSE), "\n")
