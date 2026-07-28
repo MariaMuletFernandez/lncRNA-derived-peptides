@@ -1,0 +1,570 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Differential analysis of lncRNA-derived peptides with limma
+# ============================================================
+#
+# This script:
+#   1. Imports peptide-intensity data from an Excel file.
+#   2. Applies a log2(x + 1) transformation.
+#   3. Collapses technical replicates by averaging them.
+#   4. Performs quantile normalization.
+#   5. Compares AD samples with all control samples using limma.
+#   6. Optionally compares the two control subgroups.
+#   7. Exports result tables and publication-ready figures.
+#
+# Expected sample naming convention:
+#   AD3_1_A, AD3_1_B, AD3_1_C  -> technical replicates of AD3_1
+#   C_1_A, C_1_B, C_1_C        -> technical replicates of C_1
+#   C_4_A, C_4_B, C_4_C        -> independent control pools; not collapsed
+#
+# Requirements:
+#   install.packages(c("readxl", "openxlsx", "dplyr", "stringr",
+#                      "ggplot2", "pheatmap", "tidyr"))
+#   BiocManager::install("limma")
+#
+# ============================================================
+
+# -----------------------------
+# 1. Load required packages
+# -----------------------------
+required_packages <- c(
+  "readxl",
+  "openxlsx",
+  "dplyr",
+  "stringr",
+  "limma",
+  "ggplot2",
+  "pheatmap",
+  "tidyr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following packages are missing: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this script.",
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)
+  library(dplyr)
+  library(stringr)
+  library(limma)
+  library(ggplot2)
+  library(pheatmap)
+  library(tidyr)
+})
+
+# -----------------------------
+# 2. User configuration
+# -----------------------------
+input_file <- "input_peptide_intensities.xlsx"
+output_dir <- "limma_results"
+
+metadata_cols <- c("Concatenate")
+
+# Samples beginning with this prefix are classified as AD.
+ad_prefix <- "^AD"
+
+# Samples beginning with this prefix are treated as independent SZ pools and
+# are therefore not averaged across suffixes.
+sz_pool_prefix <- "^C_4_"
+
+# Statistical thresholds
+fdr_threshold <- 0.05
+log2fc_threshold <- 1
+
+# Number of top significant peptides to display as boxplots
+top_n_boxplots <- 5
+
+# Plot limits. Set to NULL to let ggplot choose the limits automatically.
+volcano_xlim <- c(-2.5, 2.5)
+
+# Output names
+collapsed_file <- file.path(output_dir, "dataset_collapsed_for_limma.xlsx")
+normalized_file <- file.path(output_dir, "dataset_normalized_for_limma.xlsx")
+main_results_file <- file.path(output_dir, "limma_AD_vs_all_controls.xlsx")
+control_results_file <- file.path(output_dir, "limma_control_AD_vs_control_SZ.xlsx")
+volcano_file <- file.path(output_dir, "volcano_plot_AD_vs_controls.png")
+ma_file <- file.path(output_dir, "MA_plot_AD_vs_controls.png")
+heatmap_file <- file.path(output_dir, "heatmap_significant_peptides.png")
+boxplot_file <- file.path(output_dir, "boxplots_top_differential_peptides.png")
+
+# -----------------------------
+# 3. Helper functions
+# -----------------------------
+check_required_columns <- function(data, columns) {
+  missing_columns <- setdiff(columns, colnames(data))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+}
+
+make_unique_feature_ids <- function(data, metadata_columns) {
+  feature_ids <- apply(
+    data[, metadata_columns, drop = FALSE],
+    1,
+    function(x) paste(x, collapse = " | ")
+  )
+
+  make.unique(as.character(feature_ids))
+}
+
+get_individual_id <- function(sample_name) {
+  # Keep C_4 pools as independent samples.
+  if (str_detect(sample_name, sz_pool_prefix)) {
+    return(sample_name)
+  }
+
+  # Remove the final replicate suffix, e.g. AD3_1_A -> AD3_1.
+  str_remove(sample_name, "_[A-Za-z0-9]+$")
+}
+
+collapse_technical_replicates <- function(data, sample_columns) {
+  individual_ids <- vapply(sample_columns, get_individual_id, character(1))
+  unique_ids <- unique(individual_ids)
+
+  collapsed <- vapply(
+    unique_ids,
+    function(individual_id) {
+      replicate_columns <- sample_columns[individual_ids == individual_id]
+      replicate_matrix <- as.matrix(data[, replicate_columns, drop = FALSE])
+      rowMeans(replicate_matrix, na.rm = TRUE)
+    },
+    numeric(nrow(data))
+  )
+
+  # vapply returns a vector when there is only one individual.
+  if (is.null(dim(collapsed))) {
+    collapsed <- matrix(collapsed, ncol = 1)
+    colnames(collapsed) <- unique_ids
+  }
+
+  as.data.frame(collapsed, check.names = FALSE)
+}
+
+add_significance_columns <- function(results_table) {
+  results_table %>%
+    mutate(
+      FDR = adj.P.Val,
+      Significant = if_else(
+        FDR < fdr_threshold & abs(logFC) > log2fc_threshold,
+        "YES",
+        "NO"
+      ),
+      Category = case_when(
+        FDR < fdr_threshold & logFC > log2fc_threshold ~ "Up",
+        FDR < fdr_threshold & logFC < -log2fc_threshold ~ "Down",
+        TRUE ~ "Not significant"
+      ),
+      negLog10FDR = -log10(pmax(FDR, .Machine$double.xmin))
+    )
+}
+
+save_plot <- function(plot_object, filename, width, height, dpi = 300) {
+  ggsave(
+    filename = filename,
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi,
+    bg = "white"
+  )
+}
+
+# -----------------------------
+# 4. Import and validate data
+# -----------------------------
+if (!file.exists(input_file)) {
+  stop(
+    "Input file not found: ", input_file,
+    "\nEdit 'input_file' in the user configuration section.",
+    call. = FALSE
+  )
+}
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+df <- read_excel(input_file)
+check_required_columns(df, metadata_cols)
+
+sample_cols <- setdiff(colnames(df), metadata_cols)
+
+if (length(sample_cols) < 2) {
+  stop("At least two sample columns are required.", call. = FALSE)
+}
+
+# Convert sample values to numeric and report non-numeric entries.
+df[sample_cols] <- lapply(df[sample_cols], function(x) {
+  converted <- suppressWarnings(as.numeric(x))
+
+  if (sum(is.na(converted)) > sum(is.na(x))) {
+    warning("Some non-numeric sample values were converted to NA.")
+  }
+
+  converted
+})
+
+feature_ids <- make_unique_feature_ids(df, metadata_cols)
+
+# -----------------------------
+# 5. Log2 transformation
+# -----------------------------
+if (any(unlist(df[sample_cols]) < 0, na.rm = TRUE)) {
+  stop(
+    "Negative intensity values were detected. log2(x + 1) cannot be applied safely.",
+    call. = FALSE
+  )
+}
+
+df_log2 <- df
+df_log2[sample_cols] <- lapply(df_log2[sample_cols], function(x) log2(x + 1))
+
+# -----------------------------
+# 6. Collapse technical replicates
+# -----------------------------
+collapsed_samples <- collapse_technical_replicates(df_log2, sample_cols)
+collapsed_df <- bind_cols(df_log2[, metadata_cols, drop = FALSE], collapsed_samples)
+
+write.xlsx(collapsed_df, collapsed_file, overwrite = TRUE)
+
+all_samples <- colnames(collapsed_samples)
+
+# -----------------------------
+# 7. Define study groups
+# -----------------------------
+group <- if_else(str_detect(all_samples, ad_prefix), "AD", "Control")
+group <- factor(group, levels = c("Control", "AD"))
+
+if (length(unique(group)) < 2) {
+  stop(
+    "Both AD and Control samples are required. Check the sample names and 'ad_prefix'.",
+    call. = FALSE
+  )
+}
+
+sample_metadata <- data.frame(
+  Sample = all_samples,
+  Group = group,
+  stringsAsFactors = FALSE
+)
+
+# -----------------------------
+# 8. Quantile normalization
+# -----------------------------
+expr_matrix <- as.matrix(collapsed_samples)
+rownames(expr_matrix) <- feature_ids
+
+normalized_matrix <- normalizeBetweenArrays(expr_matrix, method = "quantile")
+
+normalized_df <- bind_cols(
+  collapsed_df[, metadata_cols, drop = FALSE],
+  as.data.frame(normalized_matrix, check.names = FALSE)
+)
+
+write.xlsx(normalized_df, normalized_file, overwrite = TRUE)
+
+# -----------------------------
+# 9. limma: AD versus all controls
+# -----------------------------
+design <- model.matrix(~ group)
+rownames(design) <- all_samples
+
+fit <- lmFit(normalized_matrix, design)
+fit <- eBayes(fit)
+
+results <- topTable(
+  fit,
+  coef = "groupAD",
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+)
+
+results$FeatureID <- rownames(results)
+rownames(results) <- NULL
+results <- add_significance_columns(results)
+
+metadata_lookup <- collapsed_df[, metadata_cols, drop = FALSE]
+metadata_lookup$FeatureID <- feature_ids
+
+final_results <- results %>%
+  left_join(metadata_lookup, by = "FeatureID") %>%
+  relocate(all_of(metadata_cols), .before = FeatureID)
+
+write.xlsx(final_results, main_results_file, overwrite = TRUE)
+
+# -----------------------------
+# 10. Control subgroup comparison
+# -----------------------------
+control_samples <- all_samples[group == "Control"]
+
+if (length(control_samples) >= 2) {
+  control_type <- if_else(
+    str_detect(control_samples, sz_pool_prefix),
+    "Control_SZ",
+    "Control_AD"
+  )
+  control_type <- factor(control_type, levels = c("Control_AD", "Control_SZ"))
+
+  if (length(unique(control_type)) == 2) {
+    expr_ctrl <- normalized_matrix[, control_samples, drop = FALSE]
+    design_ctrl <- model.matrix(~ control_type)
+    rownames(design_ctrl) <- control_samples
+
+    fit_ctrl <- lmFit(expr_ctrl, design_ctrl)
+    fit_ctrl <- eBayes(fit_ctrl)
+
+    results_ctrl <- topTable(
+      fit_ctrl,
+      coef = "control_typeControl_SZ",
+      number = Inf,
+      adjust.method = "BH",
+      sort.by = "P"
+    )
+
+    results_ctrl$FeatureID <- rownames(results_ctrl)
+    rownames(results_ctrl) <- NULL
+    results_ctrl <- results_ctrl %>% mutate(FDR = adj.P.Val)
+
+    final_ctrl_results <- results_ctrl %>%
+      left_join(metadata_lookup, by = "FeatureID") %>%
+      relocate(all_of(metadata_cols), .before = FeatureID)
+
+    write.xlsx(final_ctrl_results, control_results_file, overwrite = TRUE)
+  } else {
+    warning(
+      "The control subgroup comparison was skipped because only one control type was detected."
+    )
+    final_ctrl_results <- NULL
+  }
+} else {
+  warning("The control subgroup comparison was skipped because fewer than two controls were detected.")
+  final_ctrl_results <- NULL
+}
+
+# -----------------------------
+# 11. Volcano plot
+# -----------------------------
+category_levels <- c("Down", "Not significant", "Up")
+final_results$Category <- factor(final_results$Category, levels = category_levels)
+
+volcano_plot <- ggplot(
+  final_results,
+  aes(x = logFC, y = negLog10FDR, color = Category)
+) +
+  geom_point(size = 2.5, alpha = 0.65, na.rm = TRUE) +
+  geom_vline(
+    xintercept = c(-log2fc_threshold, log2fc_threshold),
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  geom_hline(
+    yintercept = -log10(fdr_threshold),
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Down" = "darkslategray3",
+      "Not significant" = "grey70",
+      "Up" = "coral"
+    ),
+    drop = FALSE
+  ) +
+  labs(
+    title = "AD versus controls",
+    x = expression(log[2] ~ "fold change"),
+    y = expression(-log[10] ~ "FDR"),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+
+if (!is.null(volcano_xlim)) {
+  volcano_plot <- volcano_plot + coord_cartesian(xlim = volcano_xlim)
+}
+
+save_plot(volcano_plot, volcano_file, width = 7, height = 6)
+
+# -----------------------------
+# 12. MA plot
+# -----------------------------
+mean_intensity <- rowMeans(normalized_matrix, na.rm = TRUE)
+mean_lookup <- data.frame(
+  FeatureID = rownames(normalized_matrix),
+  MeanIntensity = mean_intensity,
+  stringsAsFactors = FALSE
+)
+
+ma_df <- final_results %>%
+  left_join(mean_lookup, by = "FeatureID")
+
+ma_plot <- ggplot(
+  ma_df,
+  aes(x = MeanIntensity, y = logFC, color = Category)
+) +
+  geom_point(size = 2.5, alpha = 0.65, na.rm = TRUE) +
+  geom_hline(
+    yintercept = c(-log2fc_threshold, log2fc_threshold),
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Down" = "darkslategray3",
+      "Not significant" = "grey70",
+      "Up" = "coral"
+    ),
+    drop = FALSE
+  ) +
+  labs(
+    title = "MA plot",
+    x = "Mean normalized log2 intensity",
+    y = expression(log[2] ~ "fold change"),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  )
+
+save_plot(ma_plot, ma_file, width = 7, height = 6)
+
+# -----------------------------
+# 13. Heatmap of significant peptides
+# -----------------------------
+significant_features <- final_results %>%
+  filter(Significant == "YES") %>%
+  pull(FeatureID)
+
+if (length(significant_features) >= 2) {
+  heatmap_matrix <- normalized_matrix[significant_features, , drop = FALSE]
+
+  # Row-wise z-score. Remove rows with zero variance, which produce NA values.
+  row_sd <- apply(heatmap_matrix, 1, sd, na.rm = TRUE)
+  heatmap_matrix <- heatmap_matrix[is.finite(row_sd) & row_sd > 0, , drop = FALSE]
+
+  if (nrow(heatmap_matrix) >= 2) {
+    heatmap_scaled <- t(scale(t(heatmap_matrix)))
+
+    annotation_col <- data.frame(Group = group)
+    rownames(annotation_col) <- all_samples
+
+    pheatmap(
+      heatmap_scaled,
+      annotation_col = annotation_col,
+      show_rownames = FALSE,
+      cluster_rows = TRUE,
+      cluster_cols = TRUE,
+      border_color = NA,
+      filename = heatmap_file,
+      width = 8,
+      height = 10
+    )
+  } else {
+    warning("The heatmap was skipped because fewer than two variable significant peptides remained.")
+  }
+} else {
+  message("Heatmap skipped: fewer than two significant peptides were detected.")
+}
+
+# -----------------------------
+# 14. Boxplots of top peptides
+# -----------------------------
+top_features <- final_results %>%
+  filter(Significant == "YES") %>%
+  arrange(FDR) %>%
+  slice_head(n = top_n_boxplots) %>%
+  pull(FeatureID)
+
+if (length(top_features) > 0) {
+  boxplot_matrix <- normalized_matrix[top_features, , drop = FALSE]
+
+  boxplot_data <- as.data.frame(boxplot_matrix, check.names = FALSE) %>%
+    mutate(FeatureID = rownames(boxplot_matrix)) %>%
+    pivot_longer(
+      cols = all_of(all_samples),
+      names_to = "Sample",
+      values_to = "Intensity"
+    ) %>%
+    left_join(sample_metadata, by = "Sample") %>%
+    left_join(metadata_lookup, by = "FeatureID")
+
+  facet_label <- metadata_cols[1]
+
+  boxplot_figure <- ggplot(
+    boxplot_data,
+    aes(x = Group, y = Intensity, fill = Group)
+  ) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.15, size = 2, alpha = 0.7) +
+    facet_wrap(
+      stats::as.formula(paste("~", facet_label)),
+      scales = "free_y"
+    ) +
+    scale_fill_manual(values = c("Control" = "darkslategray3", "AD" = "coral")) +
+    labs(
+      title = paste0("Top ", length(top_features), " differential peptides"),
+      x = NULL,
+      y = "Normalized log2 intensity",
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "none",
+      strip.text = element_text(face = "bold")
+    )
+
+  save_plot(boxplot_figure, boxplot_file, width = 10, height = 6)
+} else {
+  message("Boxplots skipped: no significant peptides were detected.")
+}
+
+# -----------------------------
+# 15. Console summary
+# -----------------------------
+cat("\n==========================================\n")
+cat("limma analysis completed\n")
+cat("==========================================\n")
+cat("Input features:", nrow(df), "\n")
+cat("Technical-replicate columns:", length(sample_cols), "\n")
+cat("Collapsed samples:", length(all_samples), "\n")
+cat("AD samples:", sum(group == "AD"), "\n")
+cat("Control samples:", sum(group == "Control"), "\n")
+cat(
+  "Significant peptides (FDR <", fdr_threshold,
+  "and |log2FC| >", log2fc_threshold, "): ",
+  sum(final_results$Significant == "YES", na.rm = TRUE),
+  "\n",
+  sep = " "
+)
+
+if (!is.null(final_ctrl_results)) {
+  cat(
+    "Control subgroup differences (FDR <", fdr_threshold, "): ",
+    sum(final_ctrl_results$FDR < fdr_threshold, na.rm = TRUE),
+    "\n",
+    sep = " "
+  )
+}
+
+cat("Results directory:", normalizePath(output_dir, mustWork = FALSE), "\n")
