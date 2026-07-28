@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""Map lncRNA-derived peptides to ORFs and calculate ORF coverage.
+
+This pipeline:
+1. Reads peptide-to-transcript assignments from an Excel file.
+2. Loads only the required transcript sequences from a nucleotide FASTA file.
+3. Translates each transcript in all six reading frames.
+4. Maps every occurrence of each peptide to the translated sequences.
+5. Defines strict complete ORFs using an ATG start codon and an in-frame stop.
+6. Calculates peptide length, ORF length and peptide-to-ORF coverage.
+7. Produces mapping-level, ORF-level and length-bin summaries in one workbook.
+
+Coordinates in the output are zero-based and end-exclusive, except ``orf_stop_aa``,
+which is the position of the stop symbol in the translated sequence. ORF lengths do
+not include the terminal stop codon.
+
+Dependencies
+------------
+pandas >= 1.5
+openpyxl >= 3.0
+
+Example
+-------
+python lncrna_peptide_orf_mapping.py \\
+    --peptides filtered_peptides.xlsx \\
+    --fasta lncRNA_transcripts.fasta \\
+    --output results/orf_mapping_and_coverage.xlsx
+
+
+Author: Maria Mulet
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+
+import pandas as pd
+
+
+CODON_TABLE: Dict[str, str] = {
+    "ATA": "I", "ATC": "I", "ATT": "I", "ATG": "M",
+    "ACA": "T", "ACC": "T", "ACG": "T", "ACT": "T",
+    "AAC": "N", "AAT": "N", "AAA": "K", "AAG": "K",
+    "AGC": "S", "AGT": "S", "AGA": "R", "AGG": "R",
+    "CTA": "L", "CTC": "L", "CTG": "L", "CTT": "L",
+    "CCA": "P", "CCC": "P", "CCG": "P", "CCT": "P",
+    "CAC": "H", "CAT": "H", "CAA": "Q", "CAG": "Q",
+    "CGA": "R", "CGC": "R", "CGG": "R", "CGT": "R",
+    "GTA": "V", "GTC": "V", "GTG": "V", "GTT": "V",
+    "GCA": "A", "GCC": "A", "GCG": "A", "GCT": "A",
+    "GAC": "D", "GAT": "D", "GAA": "E", "GAG": "E",
+    "GGA": "G", "GGC": "G", "GGG": "G", "GGT": "G",
+    "TCA": "S", "TCC": "S", "TCG": "S", "TCT": "S",
+    "TTC": "F", "TTT": "F", "TTA": "L", "TTG": "L",
+    "TAC": "Y", "TAT": "Y", "TAA": "*", "TAG": "*",
+    "TGC": "C", "TGT": "C", "TGA": "*", "TGG": "W",
+}
+
+VALID_AA_PATTERN = re.compile(r"^[ACDEFGHIKLMNPQRSTVWY]+$")
+DEFAULT_BINS = [0, 50, 100, 150, 200, 300, 500, 1000, float("inf")]
+DEFAULT_BIN_LABELS = [
+    "<50", "50-99", "100-149", "150-199",
+    "200-299", "300-499", "500-999", ">=1000",
+]
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Map peptide sequences to six-frame translations of lncRNA transcripts "
+            "and calculate ORF length and peptide coverage."
+        )
+    )
+    parser.add_argument("--peptides", required=True, type=Path,
+                        help="Input Excel file containing transcript accessions and peptides.")
+    parser.add_argument("--fasta", required=True, type=Path,
+                        help="Nucleotide FASTA file containing transcript sequences.")
+    parser.add_argument("--output", required=True, type=Path,
+                        help="Output Excel workbook.")
+    parser.add_argument("--accession-column", default="Accession",
+                        help="Transcript accession column name (default: Accession).")
+    parser.add_argument("--peptide-column", default="Clean peptide",
+                        help="Peptide sequence column name (default: Clean peptide).")
+    parser.add_argument("--sheet", default=0,
+                        help="Input Excel sheet name or zero-based index (default: 0).")
+    parser.add_argument("--minimum-orf-length", type=int, default=20,
+                        help="Minimum complete ORF length in amino acids (default: 20).")
+    parser.add_argument("--include-partial-orfs", action="store_true",
+                        help="Include mappings lacking an upstream ATG or downstream stop.")
+    parser.add_argument("--keep-duplicate-input-rows", action="store_true",
+                        help="Do not remove duplicate accession-peptide input pairs.")
+    return parser.parse_args()
+
+
+def normalise_sheet_argument(value: object) -> object:
+    """Convert a numeric sheet argument supplied as text to an integer."""
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
+
+
+def clean_peptide(sequence: object) -> Optional[str]:
+    """Return an uppercase unmodified peptide sequence or ``None`` if invalid."""
+    if pd.isna(sequence):
+        return None
+    peptide = str(sequence).strip().upper()
+    peptide = re.sub(r"[^A-Z]", "", peptide)
+    if not peptide or not VALID_AA_PATTERN.fullmatch(peptide):
+        return None
+    return peptide
+
+
+def clean_accession(accession: object) -> Optional[str]:
+    """Return a stripped accession or ``None`` for missing values."""
+    if pd.isna(accession):
+        return None
+    value = str(accession).strip()
+    return value or None
+
+
+def read_peptide_table(
+    path: Path,
+    accession_column: str,
+    peptide_column: str,
+    sheet: object,
+    keep_duplicates: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Read and validate the peptide table.
+
+    Returns the cleaned table and a table of excluded rows.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"Peptide file not found: {path}")
+
+    data = pd.read_excel(path, sheet_name=normalise_sheet_argument(sheet))
+    missing = [c for c in (accession_column, peptide_column) if c not in data.columns]
+    if missing:
+        raise ValueError(
+            "Missing required input column(s): " + ", ".join(missing) +
+            f". Available columns: {', '.join(map(str, data.columns))}"
+        )
+
+    data = data.copy()
+    data["input_excel_row"] = range(2, len(data) + 2)  # Excel row, including header.
+    data["transcript"] = data[accession_column].map(clean_accession)
+    data["peptide"] = data[peptide_column].map(clean_peptide)
+
+    invalid_mask = data["transcript"].isna() | data["peptide"].isna()
+    excluded = data.loc[invalid_mask].copy()
+    if not excluded.empty:
+        excluded["exclusion_reason"] = "Missing accession or invalid peptide sequence"
+
+    cleaned = data.loc[~invalid_mask].copy()
+    if not keep_duplicates:
+        duplicate_mask = cleaned.duplicated(subset=["transcript", "peptide"], keep="first")
+        duplicated = cleaned.loc[duplicate_mask].copy()
+        if not duplicated.empty:
+            duplicated["exclusion_reason"] = "Duplicate accession-peptide pair"
+            excluded = pd.concat([excluded, duplicated], ignore_index=True)
+        cleaned = cleaned.loc[~duplicate_mask].copy()
+
+    return cleaned, excluded
+
+
+def fasta_identifier(header: str) -> str:
+    """Extract the first whitespace-delimited identifier from a FASTA header."""
+    return header[1:].strip().split()[0]
+
+
+def load_target_fasta(path: Path, target_accessions: Set[str]) -> Dict[str, str]:
+    """Load only requested FASTA records into memory."""
+    if not path.is_file():
+        raise FileNotFoundError(f"FASTA file not found: {path}")
+
+    sequences: Dict[str, str] = {}
+    current_id: Optional[str] = None
+    fragments: List[str] = []
+    keep = False
+
+    def save_current() -> None:
+        if keep and current_id is not None:
+            sequence = "".join(fragments).upper().replace("U", "T")
+            sequence = re.sub(r"\s+", "", sequence)
+            sequences[current_id] = sequence
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                save_current()
+                current_id = fasta_identifier(line)
+                fragments = []
+                keep = current_id in target_accessions
+            elif keep:
+                fragments.append(line)
+        save_current()
+
+    return sequences
+
+
+def reverse_complement(sequence: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
+    translation = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
+    return sequence.translate(translation)[::-1]
+
+
+def translate_dna(sequence: str, frame_offset: int) -> str:
+    """Translate DNA from a zero-based frame offset."""
+    return "".join(
+        CODON_TABLE.get(sequence[i:i + 3], "X")
+        for i in range(frame_offset, len(sequence) - 2, 3)
+    )
+
+
+def six_frame_translations(dna: str) -> Dict[str, Tuple[str, str, int]]:
+    """Return frame name -> (protein, strand, frame offset)."""
+    reverse = reverse_complement(dna)
+    return {
+        "F1": (translate_dna(dna, 0), "+", 0),
+        "F2": (translate_dna(dna, 1), "+", 1),
+        "F3": (translate_dna(dna, 2), "+", 2),
+        "R1": (translate_dna(reverse, 0), "-", 0),
+        "R2": (translate_dna(reverse, 1), "-", 1),
+        "R3": (translate_dna(reverse, 2), "-", 2),
+    }
+
+
+def find_all_occurrences(protein: str, peptide: str) -> Iterator[int]:
+    """Yield all peptide start positions, including overlapping occurrences."""
+    start = 0
+    while True:
+        position = protein.find(peptide, start)
+        if position == -1:
+            return
+        yield position
+        start = position + 1
+
+
+def find_orf_boundaries(
+    protein: str,
+    peptide_start: int,
+    peptide_end: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Find the nearest valid upstream ATG and first downstream in-frame stop.
+
+    The start search is restricted to the translated segment after the preceding
+    stop codon, preventing an ORF from crossing an upstream stop.
+    """
+    previous_stop = protein.rfind("*", 0, peptide_start)
+    segment_start = previous_stop + 1
+
+    start = protein.rfind("M", segment_start, peptide_start + 1)
+    if start == -1:
+        start = None
+
+    stop = protein.find("*", peptide_end)
+    if stop == -1:
+        stop = None
+
+    return start, stop
+
+
+def amino_acid_to_nt_interval(
+    aa_start: int,
+    aa_end: int,
+    strand: str,
+    frame_offset: int,
+    transcript_length: int,
+) -> Tuple[int, int]:
+    """Convert a translated amino-acid interval to transcript nucleotide coordinates.
+
+    Returned coordinates are zero-based, end-exclusive and ordered from low to high
+    on the original transcript sequence.
+    """
+    translated_nt_start = frame_offset + aa_start * 3
+    translated_nt_end = frame_offset + aa_end * 3
+
+    if strand == "+":
+        return translated_nt_start, translated_nt_end
+
+    return transcript_length - translated_nt_end, transcript_length - translated_nt_start
+
+
+def map_peptides_to_orfs(
+    peptide_data: pd.DataFrame,
+    sequences: Dict[str, str],
+    minimum_orf_length: int,
+    include_partial_orfs: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Map all peptide occurrences to six-frame transcript translations."""
+    results: List[dict] = []
+    unmapped: List[dict] = []
+    translation_cache: Dict[str, Dict[str, Tuple[str, str, int]]] = {}
+
+    for row in peptide_data.itertuples(index=False):
+        transcript = row.transcript
+        peptide = row.peptide
+        input_row = row.input_excel_row
+
+        if transcript not in sequences:
+            unmapped.append({
+                "input_row": input_row,
+                "transcript": transcript,
+                "peptide": peptide,
+                "reason": "Transcript accession not found in FASTA",
+            })
+            continue
+
+        dna = sequences[transcript]
+        frames = translation_cache.setdefault(transcript, six_frame_translations(dna))
+        mapped_occurrences = 0
+        filtered_short_orfs = 0
+
+        for frame_name, (protein, strand, frame_offset) in frames.items():
+            for peptide_start in find_all_occurrences(protein, peptide):
+                peptide_end = peptide_start + len(peptide)
+                orf_start, orf_stop = find_orf_boundaries(
+                    protein, peptide_start, peptide_end
+                )
+                complete = orf_start is not None and orf_stop is not None
+                orf_status = "complete_ORF" if complete else "partial_ORF"
+                orf_length = (orf_stop - orf_start) if complete else None
+
+                if complete and orf_length < minimum_orf_length:
+                    filtered_short_orfs += 1
+                    continue
+                if not complete and not include_partial_orfs:
+                    continue
+
+                peptide_nt_start, peptide_nt_end = amino_acid_to_nt_interval(
+                    peptide_start, peptide_end, strand, frame_offset, len(dna)
+                )
+
+                if complete:
+                    orf_nt_start, orf_nt_end = amino_acid_to_nt_interval(
+                        orf_start, orf_stop, strand, frame_offset, len(dna)
+                    )
+                    peptide_start_in_orf = peptide_start - orf_start
+                    peptide_end_in_orf = peptide_end - orf_start
+                    coverage = len(peptide) / orf_length * 100
+                    orf_id = (
+                        f"{transcript}|{frame_name}|"
+                        f"aa:{orf_start}-{orf_stop}"
+                    )
+                else:
+                    orf_nt_start = orf_nt_end = None
+                    peptide_start_in_orf = peptide_end_in_orf = None
+                    coverage = None
+                    orf_id = None
+
+                results.append({
+                    "input_row": input_row,
+                    "transcript": transcript,
+                    "transcript_length_nt": len(dna),
+                    "peptide": peptide,
+                    "peptide_length_aa": len(peptide),
+                    "frame": frame_name,
+                    "strand": strand,
+                    "frame_offset_nt": frame_offset,
+                    "peptide_start_aa": peptide_start,
+                    "peptide_end_aa": peptide_end,
+                    "peptide_start_nt": peptide_nt_start,
+                    "peptide_end_nt": peptide_nt_end,
+                    "orf_start_aa": orf_start,
+                    "orf_stop_aa": orf_stop,
+                    "orf_start_nt": orf_nt_start,
+                    "orf_end_nt": orf_nt_end,
+                    "peptide_start_in_orf_aa": peptide_start_in_orf,
+                    "peptide_end_in_orf_aa": peptide_end_in_orf,
+                    "start_type": "ATG" if orf_start is not None else "NO_START",
+                    "orf_status": orf_status,
+                    "orf_length_aa": orf_length,
+                    "peptide_coverage_percent": coverage,
+                    "ORF_ID": orf_id,
+                })
+                mapped_occurrences += 1
+
+        if mapped_occurrences == 0:
+            reason = "Peptide not found in any translated frame"
+            if filtered_short_orfs:
+                reason = (
+                    "Only complete ORFs shorter than the minimum threshold were found"
+                )
+            unmapped.append({
+                "input_row": input_row,
+                "transcript": transcript,
+                "peptide": peptide,
+                "reason": reason,
+            })
+
+    return pd.DataFrame(results), pd.DataFrame(unmapped)
+
+
+def interval_union_length(intervals: Iterable[Tuple[int, int]]) -> int:
+    """Calculate the covered length of the union of half-open intervals."""
+    ordered = sorted(set(intervals))
+    if not ordered:
+        return 0
+
+    total = 0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def build_orf_summary(mapping: pd.DataFrame) -> pd.DataFrame:
+    """Create one row per complete ORF with individual and combined coverage."""
+    if mapping.empty:
+        return pd.DataFrame()
+
+    complete = mapping.loc[mapping["orf_status"] == "complete_ORF"].copy()
+    if complete.empty:
+        return pd.DataFrame()
+
+    summary_rows: List[dict] = []
+    for orf_id, group in complete.groupby("ORF_ID", sort=False):
+        intervals = list(zip(
+            group["peptide_start_in_orf_aa"].astype(int),
+            group["peptide_end_in_orf_aa"].astype(int),
+        ))
+        covered_aa = interval_union_length(intervals)
+        orf_length = int(group["orf_length_aa"].iloc[0])
+
+        summary_rows.append({
+            "ORF_ID": orf_id,
+            "transcript": group["transcript"].iloc[0],
+            "frame": group["frame"].iloc[0],
+            "strand": group["strand"].iloc[0],
+            "orf_start_aa": int(group["orf_start_aa"].iloc[0]),
+            "orf_stop_aa": int(group["orf_stop_aa"].iloc[0]),
+            "orf_start_nt": int(group["orf_start_nt"].iloc[0]),
+            "orf_end_nt": int(group["orf_end_nt"].iloc[0]),
+            "orf_length_aa": orf_length,
+            "start_type": group["start_type"].iloc[0],
+            "n_mapping_rows": len(group),
+            "n_unique_peptides": group["peptide"].nunique(),
+            "peptides": ";".join(sorted(group["peptide"].unique())),
+            "mean_individual_peptide_coverage_percent": group[
+                "peptide_coverage_percent"
+            ].mean(),
+            "covered_orf_residues_aa": covered_aa,
+            "combined_nonredundant_coverage_percent": covered_aa / orf_length * 100,
+        })
+
+    return pd.DataFrame(summary_rows).sort_values(
+        ["transcript", "frame", "orf_start_aa"]
+    ).reset_index(drop=True)
+
+
+def build_length_bin_summary(orf_summary: pd.DataFrame) -> pd.DataFrame:
+    """Summarise ORF number and coverage by predefined ORF-length bins."""
+    if orf_summary.empty:
+        return pd.DataFrame(columns=[
+            "length_group", "n_ORFs", "mean_orf_length_aa",
+            "mean_individual_peptide_coverage_percent",
+            "mean_combined_nonredundant_coverage_percent",
+            "mean_unique_peptides_per_ORF",
+        ])
+
+    binned = orf_summary.copy()
+    binned["length_group"] = pd.cut(
+        binned["orf_length_aa"],
+        bins=DEFAULT_BINS,
+        labels=DEFAULT_BIN_LABELS,
+        right=False,
+        include_lowest=True,
+    )
+
+    return (
+        binned.groupby("length_group", observed=False)
+        .agg(
+            n_ORFs=("ORF_ID", "count"),
+            mean_orf_length_aa=("orf_length_aa", "mean"),
+            mean_individual_peptide_coverage_percent=(
+                "mean_individual_peptide_coverage_percent", "mean"
+            ),
+            mean_combined_nonredundant_coverage_percent=(
+                "combined_nonredundant_coverage_percent", "mean"
+            ),
+            mean_unique_peptides_per_ORF=("n_unique_peptides", "mean"),
+        )
+        .reset_index()
+    )
+
+
+def build_run_summary(
+    peptide_data: pd.DataFrame,
+    sequences: Dict[str, str],
+    mapping: pd.DataFrame,
+    orf_summary: pd.DataFrame,
+    unmapped: pd.DataFrame,
+    excluded: pd.DataFrame,
+    minimum_orf_length: int,
+) -> pd.DataFrame:
+    """Create a compact record of pipeline inputs and outputs."""
+    complete_rows = 0 if mapping.empty else int(
+        (mapping["orf_status"] == "complete_ORF").sum()
+    )
+    partial_rows = 0 if mapping.empty else int(
+        (mapping["orf_status"] == "partial_ORF").sum()
+    )
+    metrics = [
+        ("Valid accession-peptide pairs", len(peptide_data)),
+        ("Unique requested transcripts", peptide_data["transcript"].nunique()),
+        ("Requested transcripts found in FASTA", len(sequences)),
+        ("Mapping rows retained", len(mapping)),
+        ("Complete ORF mapping rows", complete_rows),
+        ("Partial ORF mapping rows", partial_rows),
+        ("Unique complete ORFs", len(orf_summary)),
+        ("Unmapped accession-peptide pairs", len(unmapped)),
+        ("Excluded input rows", len(excluded)),
+        ("Minimum complete ORF length (aa)", minimum_orf_length),
+    ]
+    return pd.DataFrame(metrics, columns=["Metric", "Value"])
+
+
+def write_results(
+    output_path: Path,
+    mapping: pd.DataFrame,
+    orf_summary: pd.DataFrame,
+    bin_summary: pd.DataFrame,
+    unmapped: pd.DataFrame,
+    excluded: pd.DataFrame,
+    run_summary: pd.DataFrame,
+) -> None:
+    """Write all result tables to a single Excel workbook."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        run_summary.to_excel(writer, sheet_name="Run_summary", index=False)
+        mapping.to_excel(writer, sheet_name="Peptide_ORF_mapping", index=False)
+        orf_summary.to_excel(writer, sheet_name="ORF_summary", index=False)
+        bin_summary.to_excel(writer, sheet_name="ORF_length_bins", index=False)
+        unmapped.to_excel(writer, sheet_name="Unmapped_peptides", index=False)
+        excluded.to_excel(writer, sheet_name="Excluded_input_rows", index=False)
+
+
+def main() -> int:
+    """Run the complete ORF mapping and coverage pipeline."""
+    args = parse_arguments()
+
+    try:
+        peptide_data, excluded = read_peptide_table(
+            path=args.peptides,
+            accession_column=args.accession_column,
+            peptide_column=args.peptide_column,
+            sheet=args.sheet,
+            keep_duplicates=args.keep_duplicate_input_rows,
+        )
+        if peptide_data.empty:
+            raise ValueError("No valid accession-peptide pairs remain after input cleaning.")
+
+        target_accessions = set(peptide_data["transcript"])
+        sequences = load_target_fasta(args.fasta, target_accessions)
+
+        mapping, unmapped = map_peptides_to_orfs(
+            peptide_data=peptide_data,
+            sequences=sequences,
+            minimum_orf_length=args.minimum_orf_length,
+            include_partial_orfs=args.include_partial_orfs,
+        )
+        orf_summary = build_orf_summary(mapping)
+        bin_summary = build_length_bin_summary(orf_summary)
+        run_summary = build_run_summary(
+            peptide_data, sequences, mapping, orf_summary, unmapped, excluded,
+            args.minimum_orf_length,
+        )
+
+        write_results(
+            args.output, mapping, orf_summary, bin_summary,
+            unmapped, excluded, run_summary,
+        )
+
+    except (FileNotFoundError, ValueError, KeyError, OSError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    print("ORF mapping and coverage analysis completed successfully.")
+    print(f"Output workbook: {args.output.resolve()}")
+    print(run_summary.to_string(index=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
