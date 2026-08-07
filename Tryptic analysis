@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+"""Classify peptides as tryptic, semi-tryptic, or non-tryptic.
+
+The program maps peptides from an Excel table to six-frame translations of
+matching nucleotide FASTA entries and evaluates both peptide termini using
+canonical trypsin cleavage rules.
+
+@Author: María Mulet
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+from typing import Optional, Sequence
+
+import pandas as pd
+
+GENETIC_CODE = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+
+
+# ============================================================
+# CLEANING FUNCTIONS
+# ============================================================
+
+def clean_accession(value):
+    """Cleans an accession from the Excel file."""
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def clean_peptide(value):
+    """Removes spaces, modifications and non-letter characters."""
+    if pd.isna(value):
+        return ""
+
+    peptide = str(value).upper()
+    peptide = re.sub(r"[^A-Z]", "", peptide)
+
+    return peptide
+
+
+def clean_dna(value):
+    """
+    Cleans a nucleotide sequence.
+
+    Removes:
+    - real line breaks;
+    - literal /n or \\n strings;
+    - spaces and tabs;
+    - hyphens and other non-nucleotide characters.
+
+    Converts RNA U to DNA T.
+    """
+    if value is None:
+        return ""
+
+    sequence = str(value).upper()
+
+    # Remove literal representations of line breaks.
+    sequence = sequence.replace("/N", "")
+    sequence = sequence.replace("\\N", "")
+
+    # Convert RNA to DNA.
+    sequence = sequence.replace("U", "T")
+
+    # Keep only valid or ambiguous nucleotide characters.
+    sequence = re.sub(r"[^ACGTN]", "", sequence)
+
+    return sequence
+
+
+def normalize_accession(accession):
+    """
+    Normalizes accession strings for comparison.
+
+    It removes surrounding spaces and converts to uppercase.
+    """
+    return str(accession).strip().upper()
+
+
+def normalize_il(sequence):
+    """Makes isoleucine and leucine equivalent."""
+    return sequence.replace("I", "J").replace("L", "J")
+
+
+# ============================================================
+# FASTA READING
+# ============================================================
+
+def extract_header_identifiers(header):
+    """
+    Extracts possible identifiers from a FASTA header.
+
+    Examples supported:
+    >P12345 description
+    >sp|P12345|PROTEIN_NAME description
+    >tr|A0A123|ENTRY description
+    >lnc-ABC-1:1 additional information
+    """
+    header = header.strip()
+    identifiers = set()
+
+    if not header:
+        return identifiers
+
+    # Entire first whitespace-delimited field.
+    first_field = header.split()[0]
+    identifiers.add(normalize_accession(first_field))
+
+    # Pipe-separated identifiers, e.g. sp|P12345|NAME.
+    for part in first_field.split("|"):
+        if part:
+            identifiers.add(normalize_accession(part))
+
+    # Also collect tokens from the whole header.
+    for token in re.split(r"[\s|;,]+", header):
+        if token:
+            identifiers.add(normalize_accession(token))
+
+    return identifiers
+
+
+def read_fasta(fasta_path):
+    """
+    Reads a FASTA file without Biopython.
+
+    Returns a list of dictionaries containing:
+    - header
+    - identifiers
+    - sequence
+    """
+    entries = []
+
+    current_header = None
+    current_sequence_parts = []
+
+    with open(fasta_path, "r", encoding="utf-8-sig") as fasta_file:
+        for raw_line in fasta_file:
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                if current_header is not None:
+                    sequence = clean_dna(
+                        "".join(current_sequence_parts)
+                    )
+
+                    entries.append({
+                        "header": current_header,
+                        "identifiers": extract_header_identifiers(
+                            current_header
+                        ),
+                        "sequence": sequence,
+                    })
+
+                current_header = line[1:].strip()
+                current_sequence_parts = []
+
+            else:
+                current_sequence_parts.append(line)
+
+    # Save final FASTA entry.
+    if current_header is not None:
+        sequence = clean_dna("".join(current_sequence_parts))
+
+        entries.append({
+            "header": current_header,
+            "identifiers": extract_header_identifiers(
+                current_header
+            ),
+            "sequence": sequence,
+        })
+
+    return entries
+
+
+def create_fasta_index(entries):
+    """
+    Creates an index from possible FASTA identifiers to entry numbers.
+
+    One identifier can point to more than one FASTA entry.
+    """
+    index = {}
+
+    for entry_number, entry in enumerate(entries):
+        for identifier in entry["identifiers"]:
+            index.setdefault(identifier, []).append(entry_number)
+
+    return index
+
+
+def find_fasta_entries(accession, fasta_entries, fasta_index, search_full_header=True):
+    """
+    Finds FASTA entries corresponding to an Excel accession.
+
+    First attempts exact matching against extracted identifiers.
+    Optionally searches inside the complete FASTA header.
+    """
+    normalized_accession = normalize_accession(accession)
+
+    if not normalized_accession:
+        return []
+
+    matched_entry_numbers = set()
+
+    # Exact identifier match.
+    for entry_number in fasta_index.get(
+        normalized_accession,
+        []
+    ):
+        matched_entry_numbers.add(entry_number)
+
+    # Optional full-header search.
+    if (
+        search_full_header
+        and not matched_entry_numbers
+    ):
+        for entry_number, entry in enumerate(fasta_entries):
+            header_upper = entry["header"].upper()
+
+            # Use boundaries to reduce partial matches.
+            pattern = (
+                r"(?<![A-Z0-9_.:-])"
+                + re.escape(normalized_accession)
+                + r"(?![A-Z0-9_.:-])"
+            )
+
+            if re.search(pattern, header_upper):
+                matched_entry_numbers.add(entry_number)
+
+    return [
+        fasta_entries[index]
+        for index in sorted(matched_entry_numbers)
+    ]
+
+
+# ============================================================
+# SIX-FRAME TRANSLATION
+# ============================================================
+
+def reverse_complement(dna):
+    """Returns the reverse-complement DNA sequence."""
+    complement_table = str.maketrans({
+        "A": "T",
+        "T": "A",
+        "C": "G",
+        "G": "C",
+        "N": "N",
+    })
+
+    return dna.translate(complement_table)[::-1]
+
+
+def translate_dna(dna, frame_offset):
+    """
+    Translates DNA from frame offset 0, 1 or 2.
+
+    STOP codons are represented by *.
+    Codons containing ambiguous nucleotides are represented by X.
+    """
+    amino_acids = []
+
+    for position in range(
+        frame_offset,
+        len(dna) - 2,
+        3
+    ):
+        codon = dna[position:position + 3]
+
+        if "N" in codon:
+            amino_acid = "X"
+        else:
+            amino_acid = GENETIC_CODE.get(codon, "X")
+
+        amino_acids.append(amino_acid)
+
+    return "".join(amino_acids)
+
+
+def generate_six_frame_translations(dna):
+    """Generates translations for +1, +2, +3, -1, -2 and -3."""
+    translations = []
+
+    strands = {
+        "+": dna,
+        "-": reverse_complement(dna),
+    }
+
+    for strand, strand_dna in strands.items():
+        for frame_offset in range(3):
+            translations.append({
+                "strand": strand,
+                "frame": frame_offset + 1,
+                "frame_label": "{}{}".format(
+                    strand,
+                    frame_offset + 1,
+                ),
+                "frame_offset": frame_offset,
+                "translated_sequence": translate_dna(
+                    strand_dna,
+                    frame_offset,
+                ),
+            })
+
+    return translations
+
+
+# ============================================================
+# PEPTIDE MATCHING
+# ============================================================
+
+def sequences_match(translated_region, peptide, consider_il_equivalent=True):
+    """Checks whether a translated region matches the peptide."""
+    if consider_il_equivalent:
+        return (
+            normalize_il(translated_region)
+            == normalize_il(peptide)
+        )
+
+    return translated_region == peptide
+
+
+def find_peptide_occurrences(translated_sequence, peptide, consider_il_equivalent=True):
+    """
+    Finds all peptide occurrences in a translated sequence.
+
+    A match cannot cross a STOP codon.
+    """
+    positions = []
+    peptide_length = len(peptide)
+
+    if peptide_length == 0:
+        return positions
+
+    maximum_start = (
+        len(translated_sequence)
+        - peptide_length
+        + 1
+    )
+
+    for start in range(maximum_start):
+        region = translated_sequence[
+            start:start + peptide_length
+        ]
+
+        if "*" in region:
+            continue
+
+        if sequences_match(region, peptide, consider_il_equivalent):
+            positions.append(start)
+
+    return positions
+
+
+# ============================================================
+# TRYPTICITY
+# ============================================================
+
+def is_tryptic_cleavage(previous_aa, next_aa):
+    """
+    Trypsin normally cleaves after K or R unless followed by P.
+    """
+    return (
+        previous_aa in {"K", "R"}
+        and next_aa != "P"
+    )
+
+
+def count_missed_cleavages(translated_peptide):
+    """
+    Counts internal tryptic cleavage sites.
+
+    The C-terminal residue is not counted because it defines the
+    peptide boundary rather than an internal missed cleavage.
+    """
+    missed_cleavages = 0
+
+    for index in range(len(translated_peptide) - 1):
+        current_aa = translated_peptide[index]
+        next_aa = translated_peptide[index + 1]
+
+        if is_tryptic_cleavage(current_aa, next_aa):
+            missed_cleavages += 1
+
+    return missed_cleavages
+
+
+def classify_match(translated_sequence, start, peptide_length):
+    """
+    Classifies one peptide occurrence according to both termini.
+    """
+    end = start + peptide_length
+
+    translated_peptide = translated_sequence[start:end]
+
+    first_aa = translated_peptide[0]
+    last_aa = translated_peptide[-1]
+
+    # --------------------------------------------------------
+    # N-terminus
+    # --------------------------------------------------------
+
+    if start == 0:
+        previous_aa = ""
+        n_tryptic = False
+        n_description = (
+            "Unknown sequence boundary; "
+            "N-terminus not considered tryptic"
+        )
+
+    elif translated_sequence[start - 1] == "*":
+        previous_aa = "*"
+        n_tryptic = False
+        n_description = (
+            "Previous residue is a STOP; "
+            "not considered a tryptic cleavage"
+        )
+    
+    else:
+        previous_aa = translated_sequence[start - 1]
+    
+        n_tryptic = is_tryptic_cleavage(
+            previous_aa,
+            first_aa,
+        )
+    
+        if n_tryptic:
+            n_description = "Tryptic cleavage: {}|{}".format(
+                previous_aa,
+                first_aa,
+            )
+    
+        elif (
+            previous_aa in {"K", "R"}
+            and first_aa == "P"
+        ):
+            n_description = (
+                "Non-tryptic: cleavage blocked at {}|P"
+            ).format(previous_aa)
+    
+        else:
+            n_description = (
+                "Non-tryptic: preceded by {}"
+            ).format(previous_aa)
+
+    # --------------------------------------------------------
+    # C-terminus
+    # --------------------------------------------------------
+
+    if end == len(translated_sequence):
+        next_aa = ""
+        c_tryptic = last_aa in {"K", "R"}
+
+        if c_tryptic:
+            c_description = (
+                "Tryptic C-terminus: peptide ends in {}".format(
+                    last_aa
+                )
+            )
+        else:
+            c_description = (
+                "Unknown sequence boundary; peptide does not end in K or R"
+            )
+
+    elif translated_sequence[end] == "*":
+        next_aa = "*"
+        c_tryptic = last_aa in {"K", "R"}
+    
+        if c_tryptic:
+            c_description = (
+                "Tryptic C-terminus: peptide ends in {}; "
+                "subsequent STOP does not define trypticity"
+            ).format(last_aa)
+        else:
+            c_description = (
+                "Non-tryptic C-terminus before STOP; "
+                "peptide does not end in K or R"
+            )
+        
+    else:
+        next_aa = translated_sequence[end]
+    
+        c_tryptic = is_tryptic_cleavage(
+            last_aa,
+            next_aa,
+        )
+    
+        if c_tryptic:
+            c_description = "Tryptic cleavage: {}|{}".format(
+                last_aa,
+                next_aa,
+            )
+
+        elif (
+            last_aa in {"K", "R"}
+            and next_aa == "P"
+        ):
+            c_description = (
+                "Non-tryptic: cleavage blocked at {}|P"
+            ).format(last_aa)
+    
+        else:
+            c_description = (
+                "Non-tryptic: ends in {} followed by {}"
+            ).format(
+                last_aa,
+                next_aa,
+            )
+
+    # --------------------------------------------------------
+    # Overall classification
+    # --------------------------------------------------------
+
+    if n_tryptic and c_tryptic:
+        classification = "Tryptic"
+
+    elif n_tryptic or c_tryptic:
+        classification = "Semitryptic"
+
+    else:
+        classification = "Non-tryptic"
+
+    return {
+        "classification": classification,
+        "translated_peptide": translated_peptide,
+        "aa_start": start,
+        "aa_end": end,
+        "previous_aa": previous_aa,
+        "next_aa": next_aa,
+        "n_tryptic": n_tryptic,
+        "c_tryptic": c_tryptic,
+        "n_description": n_description,
+        "c_description": c_description,
+        "missed_cleavages": count_missed_cleavages(
+            translated_peptide
+        ),
+    }
+
+
+# ============================================================
+# COORDINATES
+# ============================================================
+
+def calculate_dna_coordinates(
+    dna_length,
+    strand,
+    frame_offset,
+    aa_start,
+    aa_end,
+):
+    """
+    Calculates 1-based nucleotide coordinates in the original
+    FASTA sequence.
+    """
+    translated_nt_start = (
+        frame_offset
+        + aa_start * 3
+    )
+
+    translated_nt_end = (
+        frame_offset
+        + aa_end * 3
+    )
+
+    if strand == "+":
+        dna_start = translated_nt_start + 1
+        dna_end = translated_nt_end
+
+    else:
+        dna_start = (
+            dna_length
+            - translated_nt_end
+            + 1
+        )
+
+        dna_end = (
+            dna_length
+            - translated_nt_start
+        )
+
+    return dna_start, dna_end
+
+
+# ============================================================
+# MATCH SELECTION
+# ============================================================
+
+def match_priority(match):
+    """
+    Ranking used only when the same peptide has multiple matches.
+
+    Priority:
+    1. Greater tryptic compatibility.
+    2. Fewer missed cleavages.
+    3. Exact I/L match rather than an ambiguous match.
+    """
+    classification_score = {
+        "Tryptic": 3,
+        "Semitryptic": 2,
+        "Non-tryptic": 1,
+    }
+
+    exact_match_score = int(
+        match["translated_peptide"]
+        == match["input_peptide"]
+    )
+
+    return (
+        classification_score[match["classification"]],
+        -match["missed_cleavages"],
+        exact_match_score,
+    )
+
+
+def describe_match(match):
+    """Creates a compact description of a match."""
+    return (
+        "{header}; frame {frame}; aa {aa_start}-{aa_end}; "
+        "DNA {dna_start}-{dna_end}; {classification}; "
+        "{missed} missed cleavage(s)"
+    ).format(
+        header=match["fasta_header"],
+        frame=match["frame_label"],
+        aa_start=match["aa_start"] + 1,
+        aa_end=match["aa_end"],
+        dna_start=match["dna_start"],
+        dna_end=match["dna_end"],
+        classification=match["classification"],
+        missed=match["missed_cleavages"],
+    )
+
+
+# ============================================================
+# ROW PROCESSING
+# ============================================================
+
+def empty_result():
+    """Creates the default output for an unclassified row."""
+    return {
+        "Tryptic": "Not classified",
+        "FASTA_header": "",
+        "FASTA_matches": 0,
+        "Strand": "",
+        "Reading_frame": "",
+        "Translated_match": "",
+        "Exact_IL_match": "",
+        "AA_position": "",
+        "DNA_position": "",
+        "Previous_AA": "",
+        "Next_AA": "",
+        "N_tryptic": "",
+        "C_tryptic": "",
+        "N_terminus": "",
+        "C_terminus": "",
+        "Missed_cleavages": "",
+        "Number_of_peptide_matches": 0,
+        "Tryptic_notes": "",
+    }
+
+
+def classify_excel_row(
+    row,
+    fasta_entries,
+    fasta_index,
+    accession_column="Accession",
+    peptide_column="Peptide",
+    consider_il_equivalent=True,
+    search_full_header=True,
+):
+    """
+    Finds the accession in the FASTA, performs six-frame translation
+    and classifies the peptide.
+    """
+    result = empty_result()
+
+    accession = clean_accession(
+        row.get(accession_column)
+    )
+
+    peptide = clean_peptide(
+        row.get(peptide_column)
+    )
+
+    if not accession:
+        result["Tryptic_notes"] = "Missing accession"
+        return pd.Series(result)
+
+    if not peptide:
+        result["Tryptic_notes"] = "Missing peptide"
+        return pd.Series(result)
+
+    matched_fasta_entries = find_fasta_entries(
+        accession,
+        fasta_entries,
+        fasta_index,
+        search_full_header=search_full_header,
+    )
+
+    result["FASTA_matches"] = len(
+        matched_fasta_entries
+    )
+
+    if not matched_fasta_entries:
+        result["Tryptic_notes"] = (
+            "Accession not found in FASTA"
+        )
+        return pd.Series(result)
+
+    all_peptide_matches = []
+
+    for fasta_entry in matched_fasta_entries:
+        dna = fasta_entry["sequence"]
+
+        if not dna:
+            continue
+
+        translations = generate_six_frame_translations(
+            dna
+        )
+
+        for translation in translations:
+            translated_sequence = (
+                translation["translated_sequence"]
+            )
+
+            positions = find_peptide_occurrences(
+                translated_sequence,
+                peptide,
+                consider_il_equivalent=consider_il_equivalent,
+            )
+
+            for start in positions:
+                match = classify_match(
+                    translated_sequence,
+                    start,
+                    len(peptide),
+                )
+
+                dna_start, dna_end = (
+                    calculate_dna_coordinates(
+                        dna_length=len(dna),
+                        strand=translation["strand"],
+                        frame_offset=translation[
+                            "frame_offset"
+                        ],
+                        aa_start=match["aa_start"],
+                        aa_end=match["aa_end"],
+                    )
+                )
+
+                match.update({
+                    "input_peptide": peptide,
+                    "fasta_header": fasta_entry[
+                        "header"
+                    ],
+                    "strand": translation["strand"],
+                    "frame": translation["frame"],
+                    "frame_label": translation[
+                        "frame_label"
+                    ],
+                    "dna_start": dna_start,
+                    "dna_end": dna_end,
+                })
+
+                all_peptide_matches.append(match)
+
+    result["Number_of_peptide_matches"] = len(
+        all_peptide_matches
+    )
+
+    if not all_peptide_matches:
+        headers = "; ".join(
+            entry["header"]
+            for entry in matched_fasta_entries
+        )
+
+        result["FASTA_header"] = headers
+
+        result["Tryptic_notes"] = (
+            "Accession found, but peptide not found in any "
+            "of the six translated reading frames"
+        )
+
+        return pd.Series(result)
+
+    selected = max(
+        all_peptide_matches,
+        key=match_priority,
+    )
+
+    result.update({
+        "Tryptic": selected["classification"],
+        "FASTA_header": selected["fasta_header"],
+        "Strand": selected["strand"],
+        "Reading_frame": selected["frame_label"],
+        "Translated_match": selected[
+            "translated_peptide"
+        ],
+        "Exact_IL_match": (
+            selected["translated_peptide"] == peptide
+        ),
+        "AA_position": "{}-{}".format(
+            selected["aa_start"] + 1,
+            selected["aa_end"],
+        ),
+        "DNA_position": "{}-{}".format(
+            selected["dna_start"],
+            selected["dna_end"],
+        ),
+        "Previous_AA": selected["previous_aa"],
+        "Next_AA": selected["next_aa"],
+        "N_tryptic": selected["n_tryptic"],
+        "C_tryptic": selected["c_tryptic"],
+        "N_terminus": selected["n_description"],
+        "C_terminus": selected["c_description"],
+        "Missed_cleavages": selected[
+            "missed_cleavages"
+        ],
+    })
+
+    if len(all_peptide_matches) == 1:
+        result["Tryptic_notes"] = (
+            "Unique peptide match"
+        )
+
+    else:
+        descriptions = [
+            describe_match(match)
+            for match in all_peptide_matches
+        ]
+
+        result["Tryptic_notes"] = (
+            "Multiple peptide matches found. The match with "
+            "the greatest tryptic compatibility was selected. "
+            "All matches: "
+            + "; ".join(descriptions)
+        )
+
+    return pd.Series(result)
+
+
+# ============================================================
+# COMMAND-LINE INTERFACE
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify peptides as tryptic, semi-tryptic, or non-tryptic by "
+            "mapping them to six-frame translations of nucleotide FASTA entries."
+        )
+    )
+    parser.add_argument("--input-excel", required=True, type=Path, help="Input Excel file.")
+    parser.add_argument("--input-fasta", required=True, type=Path, help="Input nucleotide FASTA file.")
+    parser.add_argument(
+        "--output-excel",
+        type=Path,
+        help=(
+            "Output Excel file. If omitted, '<input_stem>_trypticity.xlsx' is "
+            "created next to the input Excel file."
+        ),
+    )
+    parser.add_argument(
+        "--accession-column",
+        default="Accession",
+        help="Name of the accession column in the Excel file (default: Accession).",
+    )
+    parser.add_argument(
+        "--peptide-column",
+        default="Peptide",
+        help="Name of the peptide column in the Excel file (default: Peptide).",
+    )
+    parser.add_argument(
+        "--strict-il",
+        action="store_true",
+        help="Require exact I/L matching. By default, isoleucine and leucine are treated as equivalent.",
+    )
+    parser.add_argument(
+        "--no-full-header-search",
+        action="store_true",
+        help="Disable fallback accession matching against the complete FASTA header.",
+    )
+    return parser
+
+
+def run_analysis(
+    input_excel: Path,
+    input_fasta: Path,
+    output_excel: Optional[Path] = None,
+    accession_column: str = "Accession",
+    peptide_column: str = "Peptide",
+    consider_il_equivalent: bool = True,
+    search_full_header: bool = True,
+) -> Path:
+    """Run the complete classification workflow and return the output path."""
+    input_excel = Path(input_excel)
+    input_fasta = Path(input_fasta)
+
+    if output_excel is None:
+        output_excel = input_excel.with_name(f"{input_excel.stem}_trypticity.xlsx")
+    else:
+        output_excel = Path(output_excel)
+
+    if not input_excel.is_file():
+        raise FileNotFoundError(f"Excel file not found: {input_excel}")
+    if not input_fasta.is_file():
+        raise FileNotFoundError(f"FASTA file not found: {input_fasta}")
+
+    dataframe = pd.read_excel(input_excel)
+    required_columns = {accession_column, peptide_column}
+    missing_columns = required_columns - set(dataframe.columns)
+    if missing_columns:
+        raise ValueError("Missing Excel columns: " + ", ".join(sorted(missing_columns)))
+
+    print("Reading FASTA file...")
+    fasta_entries = read_fasta(input_fasta)
+    fasta_index = create_fasta_index(fasta_entries)
+    print(f"FASTA entries loaded: {len(fasta_entries)}")
+
+    print("Processing peptides...")
+    classification_columns = dataframe.apply(
+        classify_excel_row,
+        axis=1,
+        args=(
+            fasta_entries,
+            fasta_index,
+            accession_column,
+            peptide_column,
+            consider_il_equivalent,
+            search_full_header,
+        ),
+    )
+
+    output_dataframe = pd.concat([dataframe, classification_columns], axis=1)
+    output_excel.parent.mkdir(parents=True, exist_ok=True)
+    output_dataframe.to_excel(output_excel, index=False)
+
+    print("\nAnalysis completed.")
+    print(f"Rows processed: {len(output_dataframe)}")
+    print(f"Output file: {output_excel.resolve()}")
+    print("\nTrypticity summary:")
+    print(output_dataframe["Tryptic"].value_counts(dropna=False).to_string())
+
+    accession_not_found = (
+        output_dataframe["Tryptic_notes"] == "Accession not found in FASTA"
+    ).sum()
+    peptide_not_found = output_dataframe["Tryptic_notes"].str.contains(
+        "peptide not found", case=False, na=False
+    ).sum()
+
+    print("\nMatching summary:")
+    print(f"Accessions not found: {int(accession_not_found)}")
+    print(f"Peptides not found after translation: {int(peptide_not_found)}")
+    return output_excel
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Command-line entry point."""
+    args = build_parser().parse_args(argv)
+    run_analysis(
+        input_excel=args.input_excel,
+        input_fasta=args.input_fasta,
+        output_excel=args.output_excel,
+        accession_column=args.accession_column,
+        peptide_column=args.peptide_column,
+        consider_il_equivalent=not args.strict_il,
+        search_full_header=not args.no_full_header_search,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
